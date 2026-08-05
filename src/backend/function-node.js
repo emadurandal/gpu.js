@@ -2,6 +2,75 @@ const acorn = require('acorn');
 const { utils } = require('../utils');
 const { FunctionTracer } = require('./function-tracer');
 
+const mathProperties = [
+  'E',
+  'PI',
+  'SQRT2',
+  'SQRT1_2',
+  'LN2',
+  'LN10',
+  'LOG2E',
+  'LOG10E',
+];
+
+const mathFunctions = [
+  'abs',
+  'acos',
+  'acosh',
+  'asin',
+  'asinh',
+  'atan',
+  'atan2',
+  'atanh',
+  'cbrt',
+  'ceil',
+  'clz32',
+  'cos',
+  'cosh',
+  'expm1',
+  'exp',
+  'floor',
+  'fround',
+  'imul',
+  'log',
+  'log2',
+  'log10',
+  'log1p',
+  'max',
+  'min',
+  'pow',
+  'random',
+  'round',
+  'sign',
+  'sin',
+  'sinh',
+  'sqrt',
+  'tan',
+  'tanh',
+  'trunc',
+];
+
+const allowedExpressions = [
+  'value',
+  'value[]',
+  'value[][]',
+  'value[][][]',
+  'value[][][][]',
+  'value.value',
+  'value.thread.value',
+  'this.thread.value',
+  'this.output.value',
+  'this.constants.value',
+  'this.constants.value[]',
+  'this.constants.value[][]',
+  'this.constants.value[][][]',
+  'this.constants.value[][][][]',
+  'fn()[]',
+  'fn()[][]',
+  'fn()[][][]',
+  '[][]',
+];
+
 /**
  *
  * @desc Represents a single function, inside JS, webGL, or openGL.
@@ -86,7 +155,11 @@ class FunctionNode {
     }
 
     if (!this.name) {
-      throw new Error('this.name could not be set');
+      throw new Error(
+        'Function name could not be determined: the source has no name ' +
+        '(bundlers strip the name off a named function expression) and no ' +
+        '{ name } setting was given. Pass a function declaration by ' +
+        "reference, or add { name: '...' } to the addFunction settings.");
     }
 
     if (this.argumentTypes.length > 0 && this.argumentTypes.length !== this.argumentNames.length) {
@@ -183,11 +256,22 @@ class FunctionNode {
    *
    * @returns {Object} The function AST Object, note that result is cached under this.ast;
    */
+  /**
+   * Whether this backend needs `for (a, b; ...)` inits hoisted to statements
+   * before the loop -- WGSL cannot express the comma; GLSL and JS take it
+   * natively.
+   * @returns {Boolean}
+   */
+  get requiresSequenceFreeForInit() {
+    return false;
+  }
+
   getJsAST(inParser) {
     if (this.ast) {
       return this.ast;
     }
     if (typeof this.source === 'object') {
+      normalizeMinifiedStatements(this.source, this.requiresSequenceFreeForInit);
       this.traceFunctionAST(this.source);
       return this.ast = this.source;
     }
@@ -198,10 +282,14 @@ class FunctionNode {
     }
 
     const ast = Object.freeze(inParser.parse(`const parser_${ this.name } = ${ this.source };`, {
-      locations: true
+      locations: true,
+      ecmaVersion: 2020
     }));
     // take out the function object, outside the var declarations
     const functionAST = ast.body[0].declarations[0].init;
+    // minifiers fold statements into expressions; unfold them before the
+    // tracer records anything, so every backend sees plain statements
+    normalizeMinifiedStatements(functionAST, this.requiresSequenceFreeForInit);
     this.traceFunctionAST(functionAST);
 
     if (!ast) {
@@ -209,6 +297,48 @@ class FunctionNode {
     }
 
     return this.ast = functionAST;
+  }
+
+  /**
+   * @desc Argument names the function body assigns to. Backends whose
+   * arguments are not plain per-invocation locals (the cpu backend's
+   * run-wide bindings, the GL backends' uniforms) use this to decide which
+   * arguments need a per-cell shadow local (#865, #867).
+   * @returns {Set<String>} original (unsanitized) argument names
+   */
+  getAssignedArguments() {
+    if (this._assignedArguments) return this._assignedArguments;
+    const assigned = new Set();
+    const redeclared = new Set();
+    const names = this.argumentNames || [];
+    const walk = node => {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (const child of node) walk(child);
+        return;
+      }
+      if (node.type === 'AssignmentExpression' && node.left.type === 'Identifier' && names.indexOf(node.left.name) !== -1) {
+        assigned.add(node.left.name);
+      }
+      if (node.type === 'UpdateExpression' && node.argument.type === 'Identifier' && names.indexOf(node.argument.name) !== -1) {
+        assigned.add(node.argument.name);
+      }
+      // `var x` redeclaring a parameter is one binding in JavaScript; the
+      // backends emit the declaration as an ordinary local, which already
+      // shadows the argument — adding a per-cell shadow on top would split
+      // the binding in two
+      if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && names.indexOf(node.id.name) !== -1) {
+        redeclared.add(node.id.name);
+      }
+      for (const key in node) {
+        if (key === 'loc' || key === 'range' || key === 'parent') continue;
+        const child = node[key];
+        if (child && typeof child === 'object') walk(child);
+      }
+    };
+    walk(this.getJsAST());
+    for (const name of redeclared) assigned.delete(name);
+    return this._assignedArguments = assigned;
   }
 
   traceFunctionAST(ast) {
@@ -413,15 +543,22 @@ class FunctionNode {
       case 'LogicalExpression':
         return 'Boolean';
       case 'BinaryExpression':
-        // modulos is Number
         switch (ast.operator) {
           case '%':
+            // `%` never yields an Integer, whatever its operands are: both GLSL
+            // helpers it lowers to (modulo, integerCorrectionModulo) return
+            // float, and on cpu it stays a JS `%`, which is fractional too.
+            // Reporting the left operand's type here made `i % 2 === 0` emit a
+            // float/int comparison that GLSL refuses to compile.
+            return 'Number';
           case '/':
-            if (this.fixIntegerDivisionAccuracy) {
-              return 'Number';
-            } else {
-              break;
-            }
+            // JavaScript has no integer division — `a / b` is always
+            // fractional — so reporting Integer here made GLSL emit an integer
+            // divide and silently truncate. `this.thread.x / 64` came out 0 on
+            // every GPU whose integer division is already accurate, which is
+            // most desktop hardware. Math.floor(a / b) remains the way to ask
+            // for truncation, exactly as in JS.
+            return 'Number';
           case '>':
           case '<':
             return 'Boolean';
@@ -445,6 +582,17 @@ class FunctionNode {
             }
           }
           return rightType;
+        }
+        if (type === 'Integer') {
+          // JavaScript promotes: an integer combined with a fractional value
+          // is fractional, whichever side the integer is on. Reporting the
+          // left operand's type made `x * 0.5` an integer expression that
+          // rounded the 0.5 away, so it disagreed with `0.5 * x` -- the same
+          // multiplication, not commutative.
+          const rightType = this.getType(ast.right);
+          if (rightType === 'Number' || rightType === 'Float') {
+            return rightType;
+          }
         }
         return typeLookupMap[type] || type;
       case 'UpdateExpression':
@@ -592,61 +740,15 @@ class FunctionNode {
   }
 
   isAstMathVariable(ast) {
-    const mathProperties = [
-      'E',
-      'PI',
-      'SQRT2',
-      'SQRT1_2',
-      'LN2',
-      'LN10',
-      'LOG2E',
-      'LOG10E',
-    ];
     return ast.type === 'MemberExpression' &&
       ast.object && ast.object.type === 'Identifier' &&
       ast.object.name === 'Math' &&
       ast.property &&
       ast.property.type === 'Identifier' &&
-      mathProperties.indexOf(ast.property.name) > -1;
+      mathProperties.includes(ast.property.name);
   }
 
   isAstMathFunction(ast) {
-    const mathFunctions = [
-      'abs',
-      'acos',
-      'acosh',
-      'asin',
-      'asinh',
-      'atan',
-      'atan2',
-      'atanh',
-      'cbrt',
-      'ceil',
-      'clz32',
-      'cos',
-      'cosh',
-      'expm1',
-      'exp',
-      'floor',
-      'fround',
-      'imul',
-      'log',
-      'log2',
-      'log10',
-      'log1p',
-      'max',
-      'min',
-      'pow',
-      'random',
-      'round',
-      'sign',
-      'sin',
-      'sinh',
-      'sqrt',
-      'tan',
-      'tanh',
-      'trunc',
-    ];
     return ast.type === 'CallExpression' &&
       ast.callee &&
       ast.callee.type === 'MemberExpression' &&
@@ -655,7 +757,7 @@ class FunctionNode {
       ast.callee.object.name === 'Math' &&
       ast.callee.property &&
       ast.callee.property.type === 'Identifier' &&
-      mathFunctions.indexOf(ast.callee.property.name) > -1;
+      mathFunctions.includes(ast.callee.property.name);
   }
 
   isAstVariable(ast) {
@@ -844,27 +946,7 @@ class FunctionNode {
       return signatureString;
     }
 
-    const allowedExpressions = [
-      'value',
-      'value[]',
-      'value[][]',
-      'value[][][]',
-      'value[][][][]',
-      'value.value',
-      'value.thread.value',
-      'this.thread.value',
-      'this.output.value',
-      'this.constants.value',
-      'this.constants.value[]',
-      'this.constants.value[][]',
-      'this.constants.value[][][]',
-      'this.constants.value[][][][]',
-      'fn()[]',
-      'fn()[][]',
-      'fn()[][][]',
-      '[][]',
-    ];
-    if (allowedExpressions.indexOf(signatureString) > -1) {
+    if (allowedExpressions.includes(signatureString)) {
       return signatureString;
     }
     return null;
@@ -966,7 +1048,7 @@ class FunctionNode {
     }
 
     const debugString = utils.getAstString(this.source, ast);
-    const leadingSource = this.source.substr(ast.start);
+    const leadingSource = this.source.slice(ast.start);
     const splitLines = leadingSource.split(/\n/);
     const lineBefore = splitLines.length > 0 ? splitLines[splitLines.length - 1] : 0;
     return new Error(`${error} on line ${ splitLines.length }, position ${ lineBefore.length }:\n ${ debugString }`);
@@ -1049,6 +1131,11 @@ class FunctionNode {
    * @returns {Array} the append retArr
    */
   astExpressionStatement(esNode, retArr) {
+    // an assignment used as a statement needs no parentheses; the emitters
+    // consume this marker and parenthesize everywhere else (#854)
+    if (esNode.expression.type === 'AssignmentExpression') {
+      this.pushState('assignment-as-statement');
+    }
     this.astGeneric(esNode.expression, retArr);
     retArr.push(';');
     return retArr;
@@ -1492,6 +1579,296 @@ const typeLookupMap = {
   'ArrayTexture(3)': 'Array(3)',
   'ArrayTexture(4)': 'Array(4)',
 };
+
+/**
+ * De-minification: minifiers (esbuild, terser) fold statements into
+ * expressions -- `if (c) { x = 1; }` becomes `c && (x = 1)`, statement
+ * sequences become comma expressions, if/else becomes a ternary of
+ * assignments. In statement position the folded expression's VALUE is
+ * discarded, so unfolding back into statements is always
+ * semantics-preserving, no side-effect analysis required. Runs on the parsed
+ * AST before FunctionTracer records anything, so every backend sees plain
+ * statements; on webgl it also runs before the FXC hoisting normalization,
+ * which only understands statement shapes.
+ *
+ * Synthetic nodes are stamped with unique start/end: astKey and the
+ * literal-type cache are keyed by position. The 0x20000000 base is disjoint
+ * from real acorn offsets and from the 0x40000000 base the webgl hoisting
+ * machinery stamps its own synthetic nodes with.
+ */
+let minifiedSyntheticId = 0x20000000;
+
+function stampSynthetic(node, source) {
+  node.start = minifiedSyntheticId++;
+  node.end = minifiedSyntheticId++;
+  if (source && source.loc) node.loc = source.loc;
+  return node;
+}
+
+function normalizeMinifiedStatements(functionAST, hoistSequenceForInit) {
+  if (!functionAST || !functionAST.body || functionAST.body.type !== 'BlockStatement') {
+    return functionAST;
+  }
+  normalizeMinifiedBlock(functionAST.body, hoistSequenceForInit);
+  return functionAST;
+}
+
+function normalizeMinifiedBlock(block, hoistSequenceForInit) {
+  block.body = flattenMinified(block.body, hoistSequenceForInit);
+}
+
+function flattenMinified(statements, hoistSequenceForInit) {
+  const result = [];
+  for (let i = 0; i < statements.length; i++) {
+    const normalized = normalizeMinifiedStatement(statements[i], hoistSequenceForInit);
+    for (let j = 0; j < normalized.length; j++) {
+      result.push(normalized[j]);
+    }
+  }
+  return result;
+}
+
+function normalizeMinifiedStatement(statement, hoistSequenceForInit) {
+  switch (statement.type) {
+    case 'ExpressionStatement':
+      return unfoldExpressionStatement(statement);
+    case 'ReturnStatement':
+      // `return a && (x = 1), x` -- everything before the last comma operand
+      // is statements, the last is the actual return value
+      if (statement.argument && statement.argument.type === 'SequenceExpression') {
+        const expressions = statement.argument.expressions;
+        const result = [];
+        for (let i = 0; i < expressions.length - 1; i++) {
+          pushAll(result, unfoldExpressionStatement(toExpressionStatement(expressions[i])));
+        }
+        statement.argument = expressions[expressions.length - 1];
+        result.push(statement);
+        return result;
+      }
+      return [statement];
+    case 'BlockStatement':
+      normalizeMinifiedBlock(statement, hoistSequenceForInit);
+      return [statement];
+    case 'IfStatement':
+      statement.consequent = normalizeMinifiedNested(statement.consequent, hoistSequenceForInit);
+      if (statement.alternate) {
+        statement.alternate = normalizeMinifiedNested(statement.alternate, hoistSequenceForInit);
+      }
+      return [statement];
+    case 'ForStatement': {
+      const before = normalizeMinifiedForHeader(statement, hoistSequenceForInit);
+      if (statement.body) {
+        statement.body = normalizeMinifiedNested(statement.body, hoistSequenceForInit);
+      }
+      if (before.length > 0) {
+        before.push(statement);
+        return before;
+      }
+      return [statement];
+    }
+    case 'WhileStatement':
+    case 'DoWhileStatement':
+      if (statement.body) {
+        statement.body = normalizeMinifiedNested(statement.body, hoistSequenceForInit);
+      }
+      return [statement];
+    case 'SwitchStatement':
+      for (let i = 0; i < statement.cases.length; i++) {
+        statement.cases[i].consequent = flattenMinified(statement.cases[i].consequent, hoistSequenceForInit);
+      }
+      return [statement];
+    default:
+      return [statement];
+  }
+}
+
+/**
+ * A single-statement position (an unbraced loop body or if branch) that
+ * unfolds into several statements needs a block around them.
+ */
+function normalizeMinifiedNested(statement, hoistSequenceForInit) {
+  const normalized = normalizeMinifiedStatement(statement, hoistSequenceForInit);
+  if (normalized.length === 1) {
+    return normalized[0];
+  }
+  return stampSynthetic({ type: 'BlockStatement', body: normalized }, statement);
+}
+
+function unfoldExpressionStatement(statement) {
+  const expression = statement.expression;
+  switch (expression.type) {
+    case 'SequenceExpression': {
+      const result = [];
+      for (let i = 0; i < expression.expressions.length; i++) {
+        const operand = expression.expressions[i];
+        // a discarded bare identifier or literal is a no-op, and not even a
+        // legal statement on every backend
+        if (operand.type === 'Identifier' || operand.type === 'Literal') continue;
+        pushAll(result, unfoldExpressionStatement(toExpressionStatement(operand)));
+      }
+      return result;
+    }
+    case 'LogicalExpression': {
+      // `a && b` as a statement is `if (a) { b; }`; `a || b` is `if (!a) { b; }`
+      const test = expression.operator === '&&' ?
+        expression.left :
+        stampSynthetic({
+          type: 'UnaryExpression',
+          operator: '!',
+          prefix: true,
+          argument: expression.left,
+        }, expression.left);
+      return [stampSynthetic({
+        type: 'IfStatement',
+        test,
+        consequent: stampSynthetic({
+          type: 'BlockStatement',
+          body: unfoldExpressionStatement(toExpressionStatement(expression.right)),
+        }, expression.right),
+        alternate: null,
+      }, expression)];
+    }
+    case 'ConditionalExpression':
+      // `c ? (x = 1) : (x = 2)` as a statement is an if/else
+      return [stampSynthetic({
+        type: 'IfStatement',
+        test: expression.test,
+        consequent: stampSynthetic({
+          type: 'BlockStatement',
+          body: unfoldExpressionStatement(toExpressionStatement(expression.consequent)),
+        }, expression.consequent),
+        alternate: stampSynthetic({
+          type: 'BlockStatement',
+          body: unfoldExpressionStatement(toExpressionStatement(expression.alternate)),
+        }, expression.alternate),
+      }, expression)];
+    default:
+      return [statement];
+  }
+}
+
+function toExpressionStatement(expression) {
+  return stampSynthetic({ type: 'ExpressionStatement', expression }, expression);
+}
+
+function pushAll(target, items) {
+  for (let i = 0; i < items.length; i++) {
+    target.push(items[i]);
+  }
+}
+
+/**
+ * Loop simplification for minified for-headers. `for (i = 0, j = 0; test;
+ * i++, j++)` cannot be expressed on every backend (WGSL takes one statement
+ * per clause), so a comma INIT hoists to statements before the loop and a
+ * comma UPDATE moves to the end of the body -- with a copy ahead of every
+ * `continue` that belongs to this loop, preserving per-iteration timing.
+ * Returns the statements to place before the loop. A labeled continue makes
+ * the update rewrite unsafe, so such a loop is left exactly as written.
+ */
+function normalizeMinifiedForHeader(statement, hoistSequenceForInit) {
+  const before = [];
+  // GLSL takes a comma init natively, and hoisting it to assignment
+  // statements trips a pre-existing GL bug: a variable the tracer types as a
+  // loop counter (int) receives a float literal from the generic assignment
+  // path. WGSL cannot express the comma at all -- and crashes on it -- so
+  // only backends that require the hoist (webgpu) opt in.
+  if (hoistSequenceForInit && statement.init && statement.init.type === 'SequenceExpression') {
+    const expressions = statement.init.expressions;
+    for (let i = 0; i < expressions.length; i++) {
+      pushAll(before, unfoldExpressionStatement(toExpressionStatement(expressions[i])));
+    }
+    statement.init = null;
+  }
+  if (statement.update && statement.update.type === 'SequenceExpression') {
+    const updateStatements = [];
+    const expressions = statement.update.expressions;
+    for (let i = 0; i < expressions.length; i++) {
+      pushAll(updateStatements, unfoldExpressionStatement(toExpressionStatement(expressions[i])));
+    }
+    const body = statement.body && statement.body.type === 'BlockStatement' ?
+      statement.body :
+      stampSynthetic({ type: 'BlockStatement', body: statement.body ? [statement.body] : [] }, statement);
+    const rewritten = prependBeforeContinues(body, updateStatements);
+    if (rewritten !== null) {
+      statement.update = null;
+      statement.body = rewritten;
+      pushAll(rewritten.body, updateStatements);
+    }
+    // null: a labeled continue -- leave the loop as written rather than
+    // retime it wrongly
+  }
+  return before;
+}
+
+/**
+ * A deep copy with fresh synthetic positions on every node: the same update
+ * lands both at the body's end and ahead of each continue, and position-keyed
+ * caches must see distinct nodes.
+ */
+function cloneWithSyntheticPositions(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(cloneWithSyntheticPositions);
+  const copy = {};
+  for (const key in node) {
+    if (key === 'parent') continue;
+    copy[key] = cloneWithSyntheticPositions(node[key]);
+  }
+  if (typeof copy.start === 'number') {
+    copy.start = minifiedSyntheticId++;
+    copy.end = minifiedSyntheticId++;
+  }
+  return copy;
+}
+
+/**
+ * Puts a copy of `prefix` ahead of every continue belonging to this loop.
+ * Nested loops keep their own continues. Returns the rewritten block, or
+ * null when a labeled continue makes the rewrite unsafe.
+ */
+function prependBeforeContinues(block, prefix) {
+  let unsafe = false;
+  const visit = node => {
+    if (!node || typeof node !== 'object' || unsafe) return node;
+    if (Array.isArray(node)) return node.map(visit);
+    switch (node.type) {
+      case 'ContinueStatement':
+        if (node.label) {
+          unsafe = true;
+          return node;
+        }
+        return stampSynthetic({
+          type: 'BlockStatement',
+          body: [...cloneWithSyntheticPositions(prefix), node],
+        }, node);
+      case 'ForStatement':
+      case 'WhileStatement':
+      case 'DoWhileStatement':
+      case 'FunctionExpression':
+      case 'FunctionDeclaration':
+      case 'ArrowFunctionExpression':
+        return node;
+      case 'IfStatement':
+        node.consequent = visit(node.consequent);
+        if (node.alternate) node.alternate = visit(node.alternate);
+        return node;
+      case 'BlockStatement':
+        node.body = node.body.map(visit);
+        return node;
+      case 'SwitchStatement':
+        for (let i = 0; i < node.cases.length; i++) {
+          node.cases[i].consequent = node.cases[i].consequent.map(visit);
+        }
+        return node;
+      default:
+        return node;
+    }
+  };
+  const body = block.body.map(visit);
+  if (unsafe) return null;
+  block.body = body;
+  return block;
+}
 
 module.exports = {
   FunctionNode

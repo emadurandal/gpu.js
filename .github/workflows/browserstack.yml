@@ -1,0 +1,62 @@
+name: BrowserStack
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      browsers:
+        description: Target set
+        required: false
+        default: all
+        type: choice
+        options: [all, real-devices, desktop]
+
+jobs:
+  browserstack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Forks do not get the org's BrowserStack secrets, so skip rather than fail.
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'gpujs/gpu.js'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install packages
+        run: npm ci
+
+      - name: Build
+        # the devices load dist/, so it has to come from this commit
+        run: npm run make
+
+      # 'all' is real devices plus desktop Chrome/Firefox/Edge/Safari. The
+      # concurrency cap is 5, so nine targets run as two waves — roughly a
+      # minute. Desktop is worth the second wave: the modulo and integer
+      # division bugs only ever reproduced on desktop Chrome/Firefox/Edge,
+      # never on a phone.
+      - name: Run smoke suite
+        env:
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        run: node test/browserstack/run.js --browsers=${{ inputs.browsers || 'all' }}
+
+      # Renders three scenes and compares each GPU render against the same
+      # device's cpu render, which is bit-identical everywhere. Healthy
+      # hardware agrees to within 1 least significant bit; the integer-division
+      # bug moved 84% of mandelbrot's pixels.
+      - name: Run visual regression suite
+        env:
+          BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+          BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+        run: node test/browserstack/run.js --suite=visual --browsers=${{ inputs.browsers || 'all' }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browserstack-results
+          path: browserstack-results.json
+          if-no-files-found: ignore

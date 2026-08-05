@@ -1,19 +1,23 @@
-[<img width="100" alt="Logo" src="http://gpu.rocks/static/media/jelly.3587de60.png">](http://gpu.rocks/)
+[<img width="100" alt="Logo" src="https://raw.githubusercontent.com/gpujs/gpu.js/develop/assets/jelly.png">](https://gpu.rocks/)
 # GPU.js
 GPU.js is a JavaScript Acceleration library for GPGPU (General purpose computing on GPUs) in JavaScript for Web and Node.
 GPU.js automatically transpiles simple JavaScript functions into shader language and compiles them so they run on your GPU.
 In case a GPU is not available, the functions will still run in regular JavaScript.
 For some more quick concepts, see [Quick Concepts](https://github.com/gpujs/gpu.js/wiki/Quick-Concepts) on the wiki.
 
+**New to GPU programming?** [**Learn GPGPU in your browser**](https://gpu.rocks/learn) — a free, hands-on course that teaches the subject itself, not just this library. See [Learn GPGPU](#learn-gpgpu) below.
 
+
+[![CI](https://github.com/gpujs/gpu.js/actions/workflows/ci.yml/badge.svg)](https://github.com/gpujs/gpu.js/actions/workflows/ci.yml)
+[![BrowserStack](https://automate.browserstack.com/badge.svg?badge_key=RHFnb0dPTWdmUlZKRFdMb3lZWFdGSDcwU1dEL0tGZC9HT21BVVJPeGZ1az0tLW43V3JMeGtjdjlhWHlpZ2dZRk5ZclE9PQ%3D%3D--a13f87b6ab74da0caa0381873de301faed81c914)](https://automate.browserstack.com/public-build/RHFnb0dPTWdmUlZKRFdMb3lZWFdGSDcwU1dEL0tGZC9HT21BVVJPeGZ1az0tLW43V3JMeGtjdjlhWHlpZ2dZRk5ZclE9PQ%3D%3D--a13f87b6ab74da0caa0381873de301faed81c914)
+[![Socket score](https://socket.dev/api/badge/npm/package/gpu.js)](https://socket.dev/npm/package/gpu.js)
 [![Join the chat at https://gitter.im/gpujs/gpu.js](https://badges.gitter.im/gpujs/gpu.js.svg)](https://gitter.im/gpujs/gpu.js?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-[![Slack](https://slack.bri.im/badge.svg)](https://slack.bri.im)
 
 # What is this sorcery?
 
 Creates a GPU accelerated kernel transpiled from a javascript function that computes a single element in the 512 x 512 matrix (2D array).
 The kernel functions are ran in tandem on the GPU often resulting in very fast computations!
-You can run a benchmark of this [here](http://gpu.rocks). Typically, it will run 1-15x faster depending on your hardware.
+You can run a benchmark of this [here](https://gpu.rocks/). Typically, it will run 1-15x faster depending on your hardware.
 Matrix multiplication (perform matrix multiplication on 2 matrices of size 512 x 512) written in GPU.js:
 
 ## Browser
@@ -72,11 +76,65 @@ const c = multiplyMatrix(a, b) as number[][];
 
 [Click here](/examples) for more typescript examples.
 
+## v3 Will Be Async by Default
+
+> [!WARNING]
+> **The next major version of GPU.js will make every kernel call return a `Promise`.**  This is a breaking API change: synchronous kernel calls as you write them today will not survive the v3 upgrade unchanged.  Code written against `mode: 'async'` (new in 2.20.0) already conforms and will run on v3 unchanged — the [migration guide](#migrating-a-sync-kernel-to-async) below is six steps.
+
+This breaks the API you are using today, so it warrants both notice and an apology.  We owe you the apology because the original synchronous design was not forward-thinking, and we should have started async in the first place.  A GPU is an asynchronous device: you hand it work, and the results are ready later.  WebGL let this library pretend otherwise — `readPixels` silently freezes the page until the GPU catches up, and we built our API on that pretense because it made the first example look like an ordinary function call.  The cost has been paid by every user since: every kernel readback blocks the main thread for its full duration (measurably ~96% of a readback-heavy loop frozen, in one stall as long as the whole loop), and WebGPU — which has no synchronous readback at all, correctly — cannot be offered under the synchronous contract except as a walled-off special mode.  An async-first API would have cost one `await` in the examples and none of this debt.
+
+v3 corrects the mistake: async everywhere, one contract, every backend.  The WebGL backends keep a synchronous escape hatch (`setAsyncMode(false)`) through the migration; WebGPU can never offer one.
+
+### Why WebGPU is worth breaking the API for
+
+Async-by-default is not an aesthetic preference — it is the price of making WebGPU a first-class backend instead of a walled-off special mode, and WebGPU earns that price twice over.
+
+**Performance.**  Measured on the same kernels, same machine (Apple M1 Max), against our own WebGL2 backend at its best:
+
+* 1024×1024 matrix multiplication including readback: **3× faster** (6.3 ms vs 18.5 ms; 370× vs the CPU).
+* A three-kernel pipeline chain, end to end: **4× faster** (9.0 ms vs 36.6 ms) — readback, WebGL's most expensive step, is dramatically cheaper.
+* And the readback that remains no longer freezes the page: it happens off the main thread by construction, not as a 100 ms stall the UI must absorb.
+
+**Accuracy.**  This one matters more than the speed.  Every GPU backend before WebGPU computes by pretending a fragment shader is a compute unit, and this library carries years of scar tissue from that pretense — workarounds you may be relying on without knowing it:
+
+* **No more lossy packing.**  In `precision: 'unsigned'` mode, every float in and out of a kernel is encoded into an 8-bit-per-channel RGBA pixel and decoded on the far side — a quantizing round-trip.  WebGPU kernels read and write raw IEEE-754 `f32` storage buffers; there is no encode step to lose bits in.
+* **Integer math that is actually integer.**  GLSL fragment shaders forced float emulation of integers — the `fixIntegerDivisionAccuracy` setting exists because some GPUs return `2.999…` for `9/3` and this library has to patch around them card by card.  WGSL has true 32-bit integers with exact division.  No setting, no patch, correct by construction.
+* **Exact addressing.**  Fragment-shader kernels locate your data by float texture-coordinate arithmetic, which is where a whole family of large-array off-by-one bugs has historically lived.  A WGSL kernel indexes its buffer with an integer thread id — `data[i]` means element `i`, at any size.
+* **A smaller surface for driver bugs.**  GLSL from this library is recompiled by whatever shader stack each machine ships — an eight-year-old wrong-results bug on Windows (#300) traced to Microsoft's `d3dcompiler_47.dll` miscompiling a nested texture read, and it was invisible on every other platform.  WGSL is a smaller, more rigorously specified language with a conformance-tested compilation path; entire categories of that risk simply do not apply to compute shaders reading storage buffers.
+
+The synchronous API is the only thing standing between users and those improvements being the default.  That is why it goes.
+
+### Migrating a sync kernel to async
+
+The v3 contract is available today — opt in with `mode: 'async'` (or `asyncMode: true` per kernel) and your code is already v3-shaped:
+
+```js
+// v2 (sync)
+const gpu = new GPU();
+const kernel = gpu.createKernel(fn).setOutput([512, 512]);
+const result = kernel(a, b);
+
+// v3 (async) — works today with { mode: 'async' }
+const gpu = new GPU({ mode: 'async' });
+const kernel = gpu.createKernel(fn).setOutput([512, 512]);
+const result = await kernel(a, b);
+```
+
+1. **`await` every kernel call.**  The resolved value has exactly the shape the sync call returned — nothing else about your code changes.  Callers become `async` functions; at the top level, wrap in an async IIFE or use top-level `await`.
+2. **Sequential loops just gain the `await`:** `for (…) { total = await step(total); }` — iteration order and semantics are unchanged.
+3. **Pipeline results: `await result.toArray()`.**  `await` is harmless on the synchronous backends' textures, so this form is portable across all backends today.
+4. **Chains of kernels: keep `pipeline: true` and await only the end.**  Handles pass between kernels without readback, exactly as before; you pay one `await` at the final readback instead of a main-thread stall at every stage.
+5. **Graphical kernels: `await kernel.getPixels()`.**  Under the async contract `getPixels()` returns a Promise on every backend — resolved immediately on the GL and cpu backends, genuinely asynchronous on webgpu — so the awaited form is the portable one.  (A graphical kernel call itself stays fire-and-forget: an un-awaited `kernel()` per animation frame is fine.)
+6. **Library authors:** return the Promise; don't resolve it on your callers' behalf.  Code written against `mode: 'async'` in v2 will run unchanged on v3.
+
 # Table of Contents
 
 Notice documentation is off?  We do try our hardest, but if you find something,
   [please bring it to our attention](https://github.com/gpujs/gpu.js/issues), or _[become a contributor](#contributors)_!
 
+* [v3 Will Be Async by Default](#v3-will-be-async-by-default)
+* [Learn GPGPU](#learn-gpgpu)
+* [Supported Backends](#supported-backends)
 * [Demos](#demos)
 * [Installation](#installation)
 * [`GPU` Settings](#gpu-settings)
@@ -106,6 +164,10 @@ Notice documentation is off?  We do try our hardest, but if you find something,
 * [Typescript Typings](#typescript-typings)
 * [Destructured Assignments](#destructured-assignments-new-in-v2)
 * [Dealing With Transpilation](#dealing-with-transpilation)
+* [WebGPU](#webgpu)
+* [WebAssembly](#webassembly)
+* [Pipeline Compilation](#pipeline-compilation)
+* [Asynchronous Kernels](#asynchronous-kernels)
 * [Full API reference](#full-api-reference)
 * [How possible in node](#how-possible-in-node)
 * [Testing](#testing)
@@ -114,6 +176,37 @@ Notice documentation is off?  We do try our hardest, but if you find something,
 * [Contributing](#contributing)
 * [Terms Explained](#terms-explained)
 * [License](#license)
+
+## Learn GPGPU
+
+**[Learn GPGPU in your browser](https://gpu.rocks/learn)** — a free, hands-on course built on GPU.js. Fifteen lessons across three modules, roughly ten hours, with no toolchain to install: you write real kernels in the page and run them on your own GPU, with the results in front of you.
+
+The point worth making is that **it teaches GPGPU, not just this library**. GPU.js is the vehicle, chosen because JavaScript in a browser is the shortest path from "no setup" to "code running on your GPU" — but what you take away is the subject itself, and it transfers:
+
+* **The mental model is universal.** A kernel is one function run across a grid of threads; `this.thread` is CUDA's `threadIdx`/`blockIdx`, WGSL's `global_invocation_id`, and OpenCL's `get_global_id()` wearing different clothes. Once you think in kernels, the syntax is a detail.
+* **The hard-won lessons are hardware lessons, not API lessons.** Why moving data usually costs more than computing on it, why keeping intermediate results on the device (pipelining) changes everything, why a parallel reduction is shaped the way it is, why float precision bites, and how to measure a GPU honestly instead of timing an unsynchronized queue — every one of those is as true in CUDA or Metal as it is here.
+* **The algorithms are the canonical ones.** Matrix multiply, reductions, convolution, Monte Carlo, N-body, cellular automata, reaction–diffusion, ray marching — the same worked examples you meet in any GPU course, just without a two-hour install first.
+
+| module | lessons |
+|---|---|
+| **1 — Fundamentals** | Hello, Kernel · Data In, Data Out · Thinking in Parallel · Pipelines & Textures · Measuring Speed Honestly |
+| **2 — Real algorithms** | Matrix Multiply · Reductions · Convolution & Filters · Monte Carlo Methods · N-Body Gravity |
+| **3 — Graphics** | Pixels from Scratch · Escape-Time Fractals · Cellular Automata · Reaction–Diffusion · Ray-Marched Metaballs |
+
+Start at [Hello, Kernel](https://gpu.rocks/learn/1-1) — if you can write a JavaScript `for` loop, you have the prerequisites.
+
+## Supported Backends
+
+Representative performance factor: 1024×1024 matrix multiplication including readback, versus the CPU backend on the same machine (Apple M1 Max, Chromium; your hardware will vary — run `node scripts/benchmark-webgpu.mjs` for yours).
+
+| Backend | Environment | Technology | Perf factor | Notes |
+|---|---|---|---|---|
+| `webgpu` **New in 2.20.0!** | Browser | WGSL compute shaders | **~370×** | Async API; opt-in via `mode: 'webgpu'` or automatic via `mode: 'async'` |
+| `webgl2` | Browser | GLSL ES 3.00 fragment shaders | ~127× | The default browser backend.  2.20.0 renders scalar single-precision kernels to `R32F` and reads back one float per value where the driver allows |
+| `webgl` | Browser | GLSL ES 1.00 fragment shaders | ~87× | Fallback for older browsers |
+| `headlessgl` | Node | GLSL ES 1.00 via ANGLE | ~123× | The default Node backend |
+| `webasm` **New!** | Anywhere | WebAssembly + f32x4 SIMD + threads | | Auto-selected only where no GL backend works; explicit via `mode: 'webasm'`.  Threads engage under the async contract |
+| `cpu` | Anywhere | Plain JavaScript | 1× | Guaranteed fallback; also the reference for correctness |
 
 ## Demos
 GPU.js in the wild, all around the net.  Add yours here!
@@ -142,6 +235,18 @@ GPU.js in the wild, all around the net.  Add yours here!
 * [Caesar Cipher GPU.js Example](https://observablehq.com/@robertleeplummerjr/caesar-cipher-gpu-js-example)
 * [Matrix Multiplication GPU.js + Angular Example](https://ng-gpu.surge.sh/)
 * [Conway's game of life](https://observablehq.com/@brakdag/conway-game-of-life-gpu-js)
+* [Animated parallel raytracer in TypeScript and GPU.js](https://raytracer.crypt.sg)
+* [Bilinear interpolation on an image](https://jsfiddle.net/shadowwarriorpro/tndphL1f/)
+
+More examples with screenshots: [gpu.rocks examples gallery](https://gpu.rocks/examples)
+
+### Community projects
+Libraries and tools built on GPU.js:
+* [gpujs-real-renderer](https://github.com/HarshKhandeparkar/gpujs-real-renderer) — real-time rendering of graphs, drawing boards, and more on the GPU
+* [gpujs-hive-compute](https://github.com/HarshKhandeparkar/gpujs-hive-compute) — distribute a GPU.js computation across multiple machines via WebRTC
+
+A note on CodePen: its JavaScript "loop protection" rewrites loops inside kernel functions (injecting `window.CP.shouldStopExecution(...)`), which breaks kernel transpilation. Disable loop protection in the pen's JS settings, or use Observable/JSFiddle instead.
+||||||| 6d7dde3
 
 ## Installation
 On Linux, ensure you have the correct header files installed: `sudo apt install mesa-common-dev libxi-dev` (adjust for your distribution)
@@ -192,6 +297,16 @@ Settings are an object used to create an instance of `GPU`.  Example: `new GPU(s
   * 'webgl2': Use the `WebGL2Kernel` for transpiling a kernel
   * 'headlessgl' **New in V2!**: Use the `HeadlessGLKernel` for transpiling a kernel
   * 'cpu': Use the `CPUKernel` for transpiling a kernel
+  * 'webgpu' **New!**: Use the `WebGPUKernel` — kernels compile to WGSL compute shaders over storage buffers.  Explicit opt-in only, never auto-selected, because every kernel call returns a `Promise` of its result (WebGPU readback is inherently asynchronous).  Check `GPU.isWebGPUSupported` (synchronous, `navigator.gpu` presence) or `await GPU.isWebGPUAvailable()` (requests an actual adapter).
+  * 'webasm' **New!**: Use the `WebAssemblyKernel` — kernels compile to WebAssembly bytecode with f32x4 SIMD, and split across a worker pool under the async contract.  Last in the automatic fallback chain, one step above `cpu`.  See [WebAssembly](#webassembly).
+  * 'async' **New!**: Auto-selection under the Promise contract.  Picks the best available backend (headlessgl → webgl2 → webgl → webasm → cpu), turns `asyncMode` on for every kernel, and upgrades a kernel to webgpu on its first call if an adapter answers — falling back to the proven backend if the upgraded kernel cannot handle it.  Write `await kernel(...)` once and the same code runs everywhere:
+  ```js
+  const gpu = new GPU({ mode: 'async' });
+  const kernel = gpu.createKernel(function(a) {
+    return a[this.thread.x] * 2;
+  }).setOutput([64]);
+  const result = await kernel(myArray); // webgpu, webgl2 or cpu underneath
+  ```
 * `onIstanbulCoverageVariable`: Removed in v2.11.0, use v8 coverage
 * `removeIstanbulCoverage`: Removed in v2.11.0, use v8 coverage
 
@@ -210,6 +325,7 @@ Settings are an object used to create a `kernel` or `kernelMap`.  Example: `gpu.
   ```js
   kernel(texture);
   ```
+* `asyncMode` or `kernel.setAsyncMode(boolean)` **New!**: boolean, default = `false` - every call to the kernel returns a `Promise` of the usual result.  On `webgl2` the readback goes through a pixel-pack buffer and a fence, so the main thread stays free while the GPU works (a synchronous kernel call blocks it for the whole readback); on `webgpu` kernels are always asynchronous; the other backends resolve their synchronous result so the calling contract is uniform everywhere.  Adds a small per-readback latency on webgl2 (fence completion granularity) in exchange for the unblocked main thread — pipeline intermediate kernels and await only final results where that matters.  See `mode: 'async'` for automatic backend selection under this contract.
 * `graphical` or `kernel.setGraphical(boolean)`: boolean, default = `false`
 * `loopMaxIterations` or `kernel.setLoopMaxIterations(number)`: number, default = 1000
 * `constants` or `kernel.setConstants(object)`: object, default = null
@@ -442,6 +558,11 @@ Debugging can be done in a variety of ways, and there are different levels of de
   ```js
   const { input } = require('gpu.js');
   const value = input(flattenedArray, [width, height, depth]);
+  ```
+  * **Memory layout**: the dimensions are `[x, y, z]` where `x` is the fastest-varying (innermost) index — element `(x, y, z)` lives at `flattenedArray[x + width * (y + height * z)]`. A kernel access `arg[i][j][k]` reads `z = i`, `y = j`, `x = k`, so `input(flat, [X, Y, Z])` is equivalent to a nested array of shape `[Z][Y][X]`:
+  ```js
+  input(new Float32Array([1,2, 3,4, 5,6, 7,8]), [2, 2, 2])
+  // same as: [ [[1,2],[3,4]], [[5,6],[7,8]] ]
   ```
 * HTML Image
 * Array of HTML Images
@@ -1029,6 +1150,14 @@ This is a list of the supported ones:
   Which is still not as good as CPU, but closer.
   While this isn't perfect, it should suffice in most scenarios.
   In any case, we must give thanks to [RandomPower](https://www.randompower.eu/), and this [issue](https://github.com/gpujs/gpu.js/issues/498), for assisting in improving our implementation of random.
+  * **Seeding random**: for reproducible results, give a kernel your own seed with `kernel.setRandomSeed(seed)` or the `randomSeed` kernel setting:
+    ```js
+    const kernel = gpu.createKernel(function() {
+      return Math.random();
+    }, { output: [64], randomSeed: 42 });
+    ```
+    A seeded kernel draws from a deterministic stream: consecutive runs still produce different values, but recreating the kernel (or calling `setRandomSeed` again) with the same seed replays the exact same sequence of runs.
+    Seeding requires a GPU mode (`gpu`, `webgl`, `webgl2`, `headlessgl`); in `cpu` mode `Math.random()` stays unseeded and a warning is logged.
 * `Math.round()`
 * `Math.sign()`
 * `Math.sin()`
@@ -1160,10 +1289,163 @@ Transpilation doesn't do the best job of keeping code beautiful.  To aid in this
 Here is a list of a few things that GPU.js does to fix transpilation:
 
 * When a transpiler such as [Babel](https://babeljs.io/) changes `myCall()` to `(0, _myCall.myCall)`, it is gracefully handled.
+* When a minifier such as [esbuild](https://esbuild.github.io/) or terser folds statements into expressions — `if (c) { x = 1; }` into `c && (x = 1)`, statement sequences into comma expressions, if/else into a ternary of assignments — the kernel compiles anyway: the statements are unfolded back before translation, on every backend.  So kernels that reach `createKernel` through a minified bundle work the same as in development.
+
+## WebGPU
+
+**New in 2.20.0!**
+
+WebGPU is what this library always wanted underneath: real compute shaders over real buffers.  Every other GPU backend here works by drawing a full-screen quad and abusing a fragment shader as a compute unit — values packed into texture pixels on the way in, unpacked on the way out.  The WebGPU backend compiles your kernel to a WGSL compute shader reading and writing `f32` storage buffers directly, and it shows: on an Apple M1 Max, a 1024×1024 matrix multiplication including readback runs about **3× faster than the WebGL2 backend** and 370× faster than the CPU.
+
+Because WebGPU has no synchronous readback (correctly — see [v3 Will Be Async by Default](#v3-will-be-async-by-default)), kernel calls in this mode return a `Promise` of the usual result:
+
+```js
+const gpu = new GPU({ mode: 'webgpu' });
+const kernel = gpu.createKernel(function(a, b) {
+  let sum = 0;
+  for (let i = 0; i < 512; i++) {
+    sum += a[this.thread.y][i] * b[i][this.thread.x];
+  }
+  return sum;
+}).setOutput([512, 512]);
+
+const c = await kernel(a, b); // same result shapes as every other backend
+```
+
+Feature detection is two-tier, because `navigator.gpu` can exist on a machine with no usable adapter:
+
+```js
+GPU.isWebGPUSupported;        // sync: the API surface exists
+await GPU.isWebGPUAvailable(); // async: an adapter actually answered
+```
+
+`pipeline: true` resolves to a GPU-resident buffer handle that passes straight into downstream kernels with no readback, and `await handle.toArray()` reads it back when you want the values.  Large 1D outputs dispatch past the 65,535-workgroup limit automatically.
+
+The mode is explicit opt-in and is never auto-selected — a synchronous caller handed a Promise would fail in silent, confusing ways.  If you want automatic selection, that is exactly what [`mode: 'async'`](#asynchronous-kernels) is for.  Graphical mode works: the kernel writes `this.color(...)` into a storage buffer and a fixed render pass presents it to the kernel's canvas — with one API difference, `getPixels()` returns a **Promise** (WebGPU readback is asynchronous). Since presentation needs no readback, an un-awaited `kernel()` per animation frame works.  `Math.random()` works, and differently than on the GL backends: it is a PCG generator in integer WGSL, so with `randomSeed` the stream is **bit-exact across runs and drivers** — the GL backends' float-hash generator cannot promise that.  Not yet supported (each throws a clear error): kernel maps, `toString()`, `precision: 'unsigned'`.
+
+## WebAssembly
+
+**New!**
+
+The `webasm` backend compiles your kernel to a WebAssembly module and runs it on the CPU — but not the way the `cpu` backend does.  Three things separate it from transpiled JavaScript:
+
+* **f32x4 SIMD.**  Every kernel also compiles to a vectorized body that computes four cells per step, divergent control flow handled with lane masks the way real SIMD hardware does it.  The scalar and vector paths are bit-identical — same operations, same order, per cell.
+* **Threads, under the async contract.**  With `asyncMode: true` (or `mode: 'async'`), a kernel with at least 4096 output cells splits across a lazy worker pool over one shared `WebAssembly.Memory` — `worker_threads` in Node, `Worker` in the browser (which needs the usual [cross-origin isolation headers](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer#security_requirements) for `SharedArrayBuffer`).  Results are identical whatever the split, `Math.random()` included.  The main thread never blocks.  Synchronous calls stay synchronous, single-threaded, and still SIMD.
+* **f32 semantics for free.**  Wasm arithmetic *is* IEEE-754 `f32`, so results match the GPU backends' float model without the rounding shims the `cpu` backend needs.
+
+`Math.random()` is the same PCG generator as the webgpu backend, in native i32 arithmetic: with `randomSeed` the stream is bit-exact across runs, platforms, and thread counts.
+
+Honesty about where it sits: any working GL backend outranks it.  In auto-selection (`mode: 'gpu'`, default, or `'async'`) it is chosen only where no GL context exists — a Node build without headless-gl, a browser with WebGL disabled — one step above the `cpu` fallback.  Opt in explicitly to benchmark it:
+
+```js
+const gpu = new GPU({ mode: 'webasm' });
+const kernel = gpu.createKernel(function(a, b) {
+  let sum = 0;
+  for (let i = 0; i < 512; i++) {
+    sum += a[this.thread.y][i] * b[i][this.thread.x];
+  }
+  return sum;
+}).setOutput([512, 512]);
+
+const c = kernel(a, b);        // synchronous, SIMD
+```
+
+A kernel is priced by the work it describes.  A scatter algorithm rewritten gather-style so every thread computes its own cell — compaction as a binary search per output slot, a histogram as a per-bin scan — does log-factor or bin-count times the reads of the plain loop it replaces; a GL backend hides that multiplier under thousands of parallel threads, while cpu and webasm execute it serially and pay it in full.  Measured against hand-written JavaScript of the *same* transposed algorithm, the cpu backend is within 2% and webasm within ±1.5× (its SIMD gather is often faster) — the cost is the transposition, not the transpilation.  When cpu or webasm is a likely destination, prefer the direct algorithm over the GPU-shaped rewrite.
+
+`GPU.isWebAssemblySupported` reports the platform answer.  `pipeline: true` is accepted the way the cpu backend accepts it: there is no device memory to pipeline into, so the result is a plain typed array (a fresh copy per call) that passes straight into downstream kernels.  Not yet supported: graphical mode, kernel maps, and texture/image arguments all **degrade to the cpu backend** — in auto modes and under explicit `mode: 'webasm'` alike — the console warning names the reason and `kernel.kernel.fallbackReason` carries it queryably; a graphical fallback renders into the kernel's own canvas; `toString()` throws.  Threaded runs accept a `poolSize` setting to cap the worker pool (defaults to `hardwareConcurrency`, or 4 when it cannot be read).  `precision: 'unsigned'` is accepted and computed as single precision — wasm has no packed storage to be lossy in.
+
+## Pipeline Compilation
+
+**New!**
+
+`gpu.createPipeline` compiles a whole multi-kernel computation — loops included — into one callable plan:
+
+```js
+const sweep = gpu.createKernel(function(u, q) {
+  const x = this.thread.x, y = this.thread.y;
+  if (x === 0 || y === 0 || x === this.constants.hi || y === this.constants.hi) return u[y][x];
+  return 0.25 * (u[y][x - 1] + u[y][x + 1] + u[y - 1][x] + u[y + 1][x] + q[y][x]);
+}, { constants: { hi: 1023 }, output: [1024, 1024] });
+
+const solve = gpu.createPipeline(function(u, q) {
+  for (let s = 0; s < this.constants.sweeps; s++) {
+    u = sweep(u, q);
+  }
+  return u;
+}, { constants: { sweeps: 512 } });
+
+const result = await solve(u0, q);   // one launch, fences inside, one readback
+```
+
+The orchestration function runs **once**, at build time (the first call), with opaque handles standing in for its arguments.  The kernel calls it makes are recorded — nothing executes — and plain JS control flow simply unrolls: the loop above records 512 steps over ONE kernel and two alternating buffers (a step that would overwrite data a later step still reads gets double-buffering automatically; liveness is static because the unrolled plan is a DAG).  Every later call executes the compiled plan without re-entering your code, intermediates never leave device memory, and you pay one readback at the end.  Return a handle, an Array of handles, or a plain object of handles — the call resolves to the same shape holding plain results.  Not to be confused with [Pipelining](#pipelining): `pipeline: true` keeps one kernel's *output* resident and leaves the orchestration to you per call; `createPipeline` compiles the orchestration itself.  Inner kernels do **not** need `pipeline: true` — intermediate residency is the pipeline's business, and kernels stay shared between pipelines and direct use.
+
+Because orchestration is tracing, not running, these are the rules — each violation throws at build, naming itself:
+
+* **A handle cannot be read.**  Elements, properties, `.toArray()` — anything that would need the value throws `pipeline intermediate results cannot be read during orchestration`.  A handle's only legal destinations are a kernel argument and the return value.
+* **A handle cannot be used in arithmetic or a condition.**  `if (u > 0)`, `u + 1`, `` `${u}` `` — anything that coerces throws.  Loop bounds and branches must come from `this.constants`, pipeline settings, or plain captured values.
+* **`Math.random()` throws during orchestration.**  A trace-time draw would freeze one number into every later call; orchestration must be deterministic.  `Math.random()` *inside kernels* is untouched — seeds are drawn per call, per step, at execution time.
+* **Only kernel calls are recorded, and only kernels created by the same `GPU` instance.**  Anything else a handle escapes into throws where detection is possible — handles are frozen, own-property-free class instances, so nearly any use trips a trap — but a function that merely stores a handle without touching it is beyond detection; what it stored is useless anyway.
+* **Non-handle values freeze into the plan at trace time.**  `this.constants` are trace-time facts (`sweeps: 512` above *is* the unroll count) — change them with `pipeline.setConstants({...})`, which invalidates the plan and re-traces on the next call, exactly the settings contract kernels already follow.  Closure-captured values behave the same way: snapshotted when the trace reads them, like constants.  Arguments passed to the *pipeline* are sampled at call time and uploaded once per call.
+
+Calling a pipeline **always returns a Promise** — the [async contract](#asynchronous-kernels) — and concurrent calls to one pipeline serialize in call order, like threaded kernels.  `pipeline.destroy()` releases the plan's buffers and instances, and `gpu.destroy()` reaches pipelines the way it reaches kernels.
+
+Every backend runs pipelines.  The reference path (`executorKind: 'generic'`) walks the plan through the normal kernel machinery — private per-pipeline kernel instances with `pipeline: true` forced on, your kernel's settings never observably touched — so on GL it is textures end-to-end.  On **webasm** the plan *fuses*: every step compiles over one shared `WebAssembly.Memory` laid out `[pipeline args | plan buffers]`, passes run back-to-back with intermediates never copied out between steps (`'fused-sync'`), and where wasm threads are available the worker pool executes the *whole plan* per worker with Atomics-based barriers between steps — one dispatch per pipeline call, no main-thread round trip per pass (`'fused-threaded'`).  Anything the webasm backend cannot take degrades to the generic executor under its usual contract: the reason is queryable at `pipeline.fallbackReason`, and `pipeline.executorKind` tells you which executor actually ran.
+
+### Reading what actually executed
+
+Introspection is **supported API**, not plan internals — it exists precisely so a correctness harness can assert the backend it asked for is the backend that ran (the guard that caught seventeen silent CPU degradations in #868):
+
+* `pipeline.executorKind` — `'fused-threaded'` / `'fused-sync'` (webasm), `'fused-encoder'` (webgpu), or `'generic'` (every backend, and the degradation target of the fused executors).
+* `pipeline.backend` — the mode of the kernels that actually execute, derived from the executor that ran; under degradation it says `'cpu'`, exactly like `kernel.kernel.constructor.mode` does for kernels.
+* `pipeline.fallbackReason` — why a fused executor declined this plan, `null` while fused.
+* `createPipeline(fn, { threads: false })` pins the webasm lowering to its sync path, for callers (benchmarks, mainly) whose comparisons must stay single-threaded.
+
+What the fusion buys, measured on the gauntlet's jacobi and heat benches rewritten via `createPipeline` (checksums identical to the per-pass versions): **5.7× on heat threaded, 5.2× on jacobi** (heat 890 ms vs 5073 ms per-pass, jacobi 387 ms vs 1997 ms — and 2.8×/3.2× over plain JavaScript on rows the webasm backend previously lost), against the same kernels called per pass on webasm.  The per-pass costs it deletes are exactly the ones that dominate short passes — a task round-trip through the worker pool per call, argument re-upload, and a readback per step — leaving the arithmetic, which was already SIMD.
+
+On **webgpu** the same benches run **1.55–1.62×** over per-pass chaining (jacobi 28 ms vs 44, heat 37 vs 60) — a smaller multiplier because webgpu's per-pass baseline already pipelines on the GPU queue; the encoder fusion removes the per-call JS, bind, and submit overhead that remains, and long chains feel it most (a 12,289-pass wavefront ran **10× faster** migrated).  On the **GL backends** the generic executor runs at parity with a hand-rolled two-kernel ping-pong — the pattern it generates for you — so the ergonomic win is the whole win there: one kernel and a plain loop replace duplicate kernels, upload kernels, and manual texture juggling, with identical results and no leaked per-step textures.
+
+Not in v1, stated plainly:
+
+* **No mid-plan readback.**  The plan runs start to finish; you cannot inspect an intermediate and stop early.  The name `this.check` on the orchestration context is **reserved** for this: the future design records `this.check(handle, predicate)` as a checkpoint step where the executor reads back a small reduction every N passes and ends the plan early when the predicate answers converged — residual thresholds in iterative solvers, without surrendering the fused loop.  Nothing you write today should put a `check` on the orchestration `this`.
+* **No graphical kernels inside pipelines** — throws at build.
+* **No kernel maps inside pipelines** — throws at build.
+* **`toString()` is deferred** — a pipeline cannot be exported as source yet.
+
+On webgpu, pipelines compile to the `fused-encoder` executor: every step is recorded as a compute pass into ONE command encoder over persistent storage buffers (ping-pong steps alternate between two static bind groups), one `queue.submit` runs the whole plan, and the results come back through a single `mapAsync` readback.  Anything the encoder cannot take statically — GPU-resident handles as pipeline arguments, vector-returning intermediates — degrades to the generic executor with the reason in `fallbackReason`.
+
+## Asynchronous Kernels
+
+**New in 2.20.0!**
+
+Async is a property any kernel can have, on any backend.  `asyncMode: true` (or `kernel.setAsyncMode(true)`) makes every call return a `Promise` of the usual result:
+
+```js
+const kernel = gpu.createKernel(fn, { output: [64], asyncMode: true });
+const result = await kernel(myArray);
+```
+
+What that buys depends on the backend, but the contract never changes:
+
+* **webgl2** — the readback becomes genuinely non-blocking: results are read through a pixel-pack buffer behind a GPU fence, and the main thread keeps running while the GPU works.  In a readback-heavy loop that froze the page for 105 ms straight, the same loop under `asyncMode` never stalls the main thread longer than 5 ms (measure yours: `node scripts/benchmark-async.mjs`).  The trade is a few milliseconds of added latency per readback, so pipeline intermediate kernels and await only final results where throughput matters.
+* **webgpu** — kernels are natively asynchronous; `asyncMode` is always on.
+* **cpu, webgl, headlessgl** — the synchronous result is resolved, so the calling contract stays uniform and your code stays portable.
+
+`mode: 'async'` puts the whole `GPU` instance under this contract and picks the backend for you — the best synchronously-provable one immediately (headlessgl → webgl2 → webgl → webasm → cpu), upgraded to WebGPU on a kernel's first call if an adapter actually answers.  On a GL-less platform that means webasm, where the async contract also unlocks its worker-pool threading — see the WebAssembly section for the SharedArrayBuffer caveat.  **Graphical kernels bind at creation instead**: a canvas is permanently committed to its first context type, so the backend is decided before `kernel.canvas` is ever exposed — `await GPU.isWebGPUAvailable()` before `createKernel` to guarantee the probe has settled; a kernel created before it settles stays on the proven backend, and either way the canvas never changes identity.  The Promise contract is exactly what buys the room for that probe.  A kernel the WebGPU backend cannot take yet (a kernel map, say) simply stays on the proven backend:
+
+```js
+const gpu = new GPU({ mode: 'async' });
+const kernel = gpu.createKernel(function(a) {
+  return a[this.thread.x] * 2;
+}).setOutput([64]);
+
+const result = await kernel(myArray); // webgpu, webgl2 or cpu underneath — same code
+```
 
 ## Full API Reference
 
-You can find a [complete API reference here](https://doxdox.org/gpujs/gpu.js/).
+You can find a [complete API reference here](https://gpu.rocks/api/).
+
+The reference is generated from the source with `npm run docs` and hosted from the [gpu.rocks repository](https://github.com/gpujs/gpu.rocks) (`public/api/`).
 
 ## How possible in node?
 GPU.js uses [HeadlessGL](https://github.com/stackgl/headless-gl) in node for GPU acceleration.
@@ -1174,12 +1456,57 @@ GPU.js is written in such a way, you can introduce your own backend.  Have a sug
 * Texture - A graphical artifact that is packed with data, in the case of GPU.js, bit shifted parts of a 32 bit floating point decimal
 
 ## Testing
-Testing is done (right now) manually, (help wanted [here](https://github.com/gpujs/gpu.js/issues/515) if you can!), using the following:
-* For browser, setup a webserver on the root of the gpu.js project and visit http://url/test/all.html
-* For node, run either of the 3 commands:
-  * `yarn test test/features`
-  * `yarn test test/internal`
-  * `yarn test test/issues`
+* For node, run `npm test`, or narrow it down with one of:
+  * `npx qunit test/features`
+  * `npx qunit test/internal`
+  * `npx qunit test/issues`
+* For browser, set up a webserver on the root of the gpu.js project and visit http://url/test/all.html
+
+### Real browsers and devices
+
+Because gpu.js ultimately depends on whatever the GPU driver behind a WebGL
+context does, it is also tested on real browsers and real mobile devices on
+[BrowserStack](https://www.browserstack.com/).
+
+<a href="https://www.browserstack.com/"><img src="https://d98b8t1nnulk5.cloudfront.net/production/images/layout/logo-header.png?1469004780" alt="BrowserStack" height="40"></a>
+
+**This project is tested with BrowserStack.**
+
+To run it yourself you need a BrowserStack Automate account:
+
+```bash
+npm run make                  # the devices test dist/, so build it first
+export BROWSERSTACK_USERNAME=...
+export BROWSERSTACK_ACCESS_KEY=...
+npm run test:browserstack      # smoke suite on real iOS/Android devices
+```
+
+The runner serves this checkout over a BrowserStack Local tunnel, so the
+devices exercise your working copy rather than a published build. Options:
+
+| Command | What it does |
+| --- | --- |
+| `npm run test:browserstack` | Smoke suite on the real-device set |
+| `npm run test:browserstack:desktop` | Smoke suite on desktop Chrome/Firefox/Edge/Safari |
+| `node test/browserstack/run.js --browsers=all` | Both sets |
+| `node test/browserstack/run.js --only=iPhone` | Only targets whose name matches |
+| `node test/browserstack/run.js --suite=visual` | Visual regression: compares rendered output against each device's own CPU render |
+| `node test/browserstack/run.js --suite=qunit` | The full `test/all.html` suite instead of the smoke suite |
+
+The smoke suite (`test/browserstack/smoke.html`) covers kernel compilation and
+execution in `cpu`, `webgl` and `webgl2` modes: 1D/2D/3D output, loops and
+branching, `Math` built-ins, constants and custom functions, typed-array and
+`input()` arguments, dynamic output, texture pipelines, graphical output,
+kernel maps, and both precision modes.
+
+The visual suite (`test/browserstack/visual.html`) renders a flat fill, a
+gradient and a Mandelbrot in each GPU mode and compares them against the same
+device's CPU render, which is bit-identical across hardware. Pixel-exact
+comparison between devices does not work — GPUs disagree by a least significant
+bit on ordinary rounding — so it asserts against measured tolerances instead.
+
+Targets live in `test/browserstack/browsers.js`. Results are written to
+`browserstack-results.json`.
 
 ## Building
 Building isn't required on node, but is for browser.  To build the browser's files, run: `yarn make`
@@ -1204,7 +1531,11 @@ Create issues [here](https://github.com/gpujs/gpu.js/issues) and follow the temp
 ### Contributors
 
 This project exists thanks to all the people who contribute. [[Contribute](CONTRIBUTING.md)].
-<a href="https://github.com/gpujs/gpu.js/graphs/contributors"><img src="https://opencollective.com/gpujs/contributors.svg?width=890&button=false" /></a>
+<!-- Was opencollective.com/gpujs/contributors.svg, which now returns HTTP 500
+     for every collective — their image generator queries a GraphQL field
+     ("githubContributors") that their own API no longer has. The backers and
+     sponsor images below still work, so only this one moved. -->
+<a href="https://github.com/gpujs/gpu.js/graphs/contributors"><img src="https://contrib.rocks/image?repo=gpujs/gpu.js" /></a>
 
 
 ### Backers
@@ -1221,7 +1552,7 @@ Support this project by becoming a sponsor. Your logo will show up here with a l
 ![](https://www.leadergpu.com/assets/main/logo_leadergpu-a8cacac0c90d204b7f7f6c8420c6a149e71ebe53f3f28f3fc94a01cd05c0bd93.png)
 Sponsored NodeJS GPU environment from [LeaderGPU](https://www.leadergpu.com) - These guys rock!
 
-![](https://3fxtqy18kygf3on3bu39kh93-wpengine.netdna-ssl.com/wp-content/themes/browserstack/img/browserstack-logo.svg)
+![](https://d98b8t1nnulk5.cloudfront.net/production/images/layout/logo-header.png)
 Sponsored Browser GPU environment's from [BrowserStack](https://browserstack.com) - Second to none!
 
 <a href="https://opencollective.com/gpujs/sponsor/0/website" target="_blank"><img src="https://opencollective.com/gpujs/sponsor/0/avatar.svg"></a>

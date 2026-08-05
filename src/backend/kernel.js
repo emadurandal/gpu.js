@@ -57,7 +57,17 @@ class Kernel {
     }
     this.useLegacyEncoder = false;
     this.fallbackRequested = false;
+    this.fallbackReason = null;
     this.onRequestFallback = null;
+
+    /**
+     * Supplied by GPU.createKernel; swaps in a kernel compiled for the
+     * arguments this one was handed. Declared here rather than on the GL
+     * kernel so mergeSettings carries it onto every backend -- the cpu
+     * kernel needs it for the same argument-type changes.
+     * @type {Function|null}
+     */
+    this.onRequestSwitchKernel = null;
 
     /**
      * Name of the arguments found from parsing source argument
@@ -65,6 +75,9 @@ class Kernel {
      */
     this.argumentNames = typeof source === 'string' ? utils.getArgumentNamesFromString(source) : null;
     this.argumentTypes = null;
+    // types the user pinned at creation (vs types a build inferred): what a
+    // pipeline clone must inherit to compute exactly like the original
+    this.declaredArgumentTypes = null;
     this.argumentSizes = null;
     this.argumentBitRatios = null;
     this.kernelArguments = null;
@@ -199,6 +212,15 @@ class Kernel {
     this.pipeline = false;
 
     /**
+     * Makes the kernel return a Promise of its result on every backend.
+     * Backends with a genuinely non-blocking readback (webgl2 fences,
+     * webgpu natively) use it; the rest resolve their synchronous result,
+     * so the calling contract is uniform either way.
+     * @type {Boolean}
+     */
+    this.asyncMode = false;
+
+    /**
      * Make GPU use single precision or unsigned.  Acceptable values: 'single' or 'unsigned'
      * @type {String|null}
      * @enum 'single' | 'unsigned'
@@ -220,8 +242,21 @@ class Kernel {
     this.optimizeFloatMemory = null;
     this.strictIntegers = false;
     this.fixIntegerDivisionAccuracy = null;
+
+    /**
+     * Seed for Math.random() so kernel runs are reproducible; null seeds from Math.random()
+     * @type {Number|null}
+     */
+    this.randomSeed = null;
     this.built = false;
     this.signature = null;
+
+    /**
+     * Reasons this kernel cannot serve the call it was handed, collected for
+     * the caller's switch; null when it can.
+     * @type {IReason[]|null}
+     */
+    this.switchingKernels = null;
   }
 
   /**
@@ -232,6 +267,12 @@ class Kernel {
     for (let p in settings) {
       if (!settings.hasOwnProperty(p) || !this.hasOwnProperty(p)) continue;
       switch (p) {
+        case 'argumentTypes':
+          this.argumentTypes = settings[p];
+          if (settings[p]) {
+            this.declaredArgumentTypes = Array.isArray(settings[p]) ? settings[p].slice() : settings[p];
+          }
+          continue;
         case 'output':
           if (!Array.isArray(settings.output)) {
             this.setOutput(settings.output); // Flatten output object
@@ -320,10 +361,10 @@ class Kernel {
   addFunction(source, settings = {}) {
     if (source.name && source.source && source.argumentTypes && 'returnType' in source) {
       this.functions.push(source);
-    } else if ('settings' in source && 'source' in source) {
-      this.functions.push(this.functionToIGPUFunction(source.source, source.settings));
     } else if (typeof source === 'string' || typeof source === 'function') {
       this.functions.push(this.functionToIGPUFunction(source, settings));
+    } else if ('settings' in source && 'source' in source) {
+      this.functions.push(this.functionToIGPUFunction(source.source, source.settings));
     } else {
       throw new Error(`function not properly defined`);
     }
@@ -562,6 +603,16 @@ class Kernel {
   }
 
   /**
+   * Set Promise-returning mode on/off
+   * @param {Boolean} flag
+   * @return {this}
+   */
+  setAsyncMode(flag) {
+    this.asyncMode = flag;
+    return this;
+  }
+
+  /**
    * Set precision to 'unsigned' or 'single'
    * @param {String} flag 'unsigned' or 'single'
    * @return {this}
@@ -629,6 +680,18 @@ class Kernel {
    */
   setDynamicOutput(flag) {
     this.dynamicOutput = flag;
+    return this;
+  }
+
+  /**
+   * Set a seed for Math.random(), so kernel runs are reproducible
+   * @param {Number|null} seed
+   * @return {this}
+   */
+  setRandomSeed(seed) {
+    this.randomSeed = seed;
+    // restart the math-random plugin's stream even when the seed value is unchanged
+    this._mathRandomGenerator = null;
     return this;
   }
 
@@ -706,6 +769,7 @@ class Kernel {
    * @return {this}
    */
   setArgumentTypes(argumentTypes) {
+    this.declaredArgumentTypes = Array.isArray(argumentTypes) ? argumentTypes.slice() : argumentTypes;
     if (Array.isArray(argumentTypes)) {
       this.argumentTypes = argumentTypes;
     } else {
@@ -730,11 +794,18 @@ class Kernel {
     return this;
   }
 
-  requestFallback(args) {
+  /**
+   * @param {IArguments} args
+   * @param {String} [reason] - why this kernel cannot run here; carried onto
+   * the replacement kernel as `fallbackReason` and named in the console
+   * warning, so the degradation is discoverable (#868)
+   */
+  requestFallback(args, reason) {
     if (!this.onRequestFallback) {
       throw new Error(`"onRequestFallback" not defined on ${ this.constructor.name }`);
     }
     this.fallbackRequested = true;
+    this.fallbackReason = reason || null;
     return this.onRequestFallback(args);
   }
 
@@ -878,10 +949,17 @@ class Kernel {
           case 'Integer':
           case 'Float':
           case 'ArrayTexture(1)':
-            argumentTypes[i] = utils.getVariableType(arg);
+            argumentTypes[i] = utils.getVariableType(arg, kernel.strictIntegers);
             break;
           default:
-            argumentTypes[i] = type;
+            // The recorded type only describes this value while the value
+            // still fits it. Keeping it for a value it cannot describe gives
+            // the switched-to kernel the same signature as the one that just
+            // rejected the value, so the switch resolves to a kernel that
+            // rejects it too -- and the run ends with no result at all.
+            argumentTypes[i] = utils.typeFitsValue(type, arg) ?
+              type :
+              utils.getVariableType(arg, kernel.strictIntegers);
         }
       }
     }
@@ -912,14 +990,31 @@ class Kernel {
     if (Array.isArray(settings.argumentTypes)) {
       argumentTypes = settings.argumentTypes;
     } else if (typeof settings.argumentTypes === 'object') {
-      argumentTypes = utils.getArgumentNamesFromString(sourceString)
-        .map(name => settings.argumentTypes[name]) || [];
+      const argumentNames = utils.getArgumentNamesFromString(sourceString);
+      argumentTypes = argumentNames.map(name => settings.argumentTypes[name]) || [];
+      // keyed by parameter name, and no parameter matched any key: the
+      // typical cause is a minifier having renamed every parameter (#863's
+      // sibling trap), and silently untyped arguments compute wrong values.
+      // The array form is position-based and immune.
+      const keys = Object.keys(settings.argumentTypes);
+      if (keys.length > 0 && argumentNames.length > 0 && argumentTypes.every(type => type === undefined)) {
+        throw new Error(
+          `argumentTypes keys [${ keys.join(', ') }] match none of the function's parameters ` +
+          `[${ argumentNames.join(', ') }] — a bundler may have renamed them. ` +
+          `Use the array form: argumentTypes: ['${ keys.map(k => settings.argumentTypes[k]).join("', '") }']`);
+      }
     } else {
       argumentTypes = settings.argumentTypes || [];
     }
 
     return {
-      name: utils.getFunctionNameFromString(sourceString) || null,
+      // settings.name first: bundlers strip the name off a named function
+      // expression (nothing in JS scope references it), so the source string
+      // often has none (#863). Function.prototype.name still knows inferred
+      // names (`const dbl = function (x) {...}`) that the string never had.
+      name: settings.name ||
+        utils.getFunctionNameFromString(sourceString) ||
+        (typeof source === 'function' && source.name ? source.name : null),
       source: sourceString,
       argumentTypes,
       returnType: settings.returnType || null,
@@ -932,6 +1027,51 @@ class Kernel {
    * @abstract
    */
   onActivate(previousKernel) {}
+
+  /**
+   * @desc Flags that this kernel cannot serve the call it was just handed, so
+   * the caller swaps in one compiled for these arguments.
+   * @param {IReason} reason
+   */
+  switchKernels(reason) {
+    if (this.switchingKernels) {
+      this.switchingKernels.push(reason);
+    } else {
+      this.switchingKernels = [reason];
+    }
+  }
+
+  resetSwitchingKernels() {
+    const existingValue = this.switchingKernels;
+    this.switchingKernels = null;
+    return existingValue;
+  }
+
+  /**
+   * @desc A kernel is compiled for the argument types it first saw. Reusing
+   * the instance with a fundamentally different type (an Input where an array
+   * was, a number where an array was) needs a differently-compiled kernel, so
+   * ask for the switch before running rather than computing from a value the
+   * compiled code cannot read.
+   *
+   * The GL backends also detect this inside their kernel values, but only for
+   * the types that implement the check, and never on the cpu backend; this is
+   * the one place every backend passes through.
+   * @param {IArguments|Array} args
+   */
+  checkArgumentTypes(args) {
+    if (!this.argumentTypes) return;
+    const length = Math.min(args.length, this.argumentTypes.length);
+    for (let i = 0; i < length; i++) {
+      if (!utils.typeFitsValue(this.argumentTypes[i], args[i])) {
+        this.switchKernels({
+          type: 'argumentTypeMismatch',
+          index: i,
+          needed: utils.getVariableType(args[i], this.strictIntegers),
+        });
+      }
+    }
+  }
 }
 
 function splitArgumentTypes(argumentTypesObject) {

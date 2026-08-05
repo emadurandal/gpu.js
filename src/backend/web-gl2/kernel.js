@@ -247,30 +247,221 @@ class WebGL2Kernel extends WebGLKernel {
         throw new Error('Unknown internal format');
     }
   }
+  /**
+   * @desc Reads the output as tightly as the driver will allow. RGBA/FLOAT is
+   * the only combination the spec guarantees for float color buffers, but for
+   * the R32F target scalar single-precision kernels render to, most drivers
+   * report RED/FLOAT as their implementation combination -- one float per
+   * value instead of four, so the readback transfers a quarter of the bytes.
+   * The stride-1 erect family already exists for the memory-optimized layout
+   * and describes the tight buffer exactly; unsupported drivers keep the
+   * guaranteed RGBA path untouched.
+   */
+  /**
+   * @desc Detection must happen at render time: the framebuffer is only
+   * guaranteed complete here (setup-time queries return null mid-resize on
+   * the dynamic-output path), and it must happen before renderValues resolves
+   * its erect function reference, which JavaScript does before evaluating the
+   * read call that could otherwise swap it.
+   */
+  renderValues() {
+    if (this._tightRead === undefined) {
+      this._detectTightRead();
+    }
+    return super.renderValues();
+  }
+
+  renderKernelsToArrays() {
+    if (this._tightRead === undefined) {
+      this._detectTightRead();
+    }
+    return super.renderKernelsToArrays();
+  }
+
+  readFloatPixelsToFloat32Array() {
+    if (!this._tightRead) {
+      return super.readFloatPixelsToFloat32Array();
+    }
+    const { texSize, context: gl } = this;
+    const w = texSize[0];
+    const h = texSize[1];
+    const result = new Float32Array(w * h);
+    gl.readPixels(0, 0, w, h, gl.RED, gl.FLOAT, result);
+    return result;
+  }
+
+  /**
+   * @desc The genuinely non-blocking readback: readPixels into a
+   * PIXEL_PACK_BUFFER returns immediately, a fence marks when the GPU has
+   * caught up, and getBufferSubData after the fence signals is a plain copy.
+   * The read is issued here, synchronously after the draw while the kernel's
+   * framebuffer is still bound -- later draws on the shared context cannot
+   * affect it, because pack reads are ordered with the commands before them.
+   */
+  renderOutputAsync() {
+    if (this.renderOutput !== this.renderValues) {
+      // pipeline textures (and inherited strategies) involve no transfer;
+      // resolving the synchronous render keeps the contract uniform
+      return Promise.resolve(this.renderOutput());
+    }
+    return this.renderValuesAsync();
+  }
+
+  renderValuesAsync() {
+    if (this._tightRead === undefined) {
+      this._detectTightRead();
+    }
+    const formatValues = this.formatValues;
+    const [x, y, z] = this.output;
+    return this.transferValuesAsync().then(pixels => formatValues(pixels, x, y, z));
+  }
+
+  transferValuesAsync() {
+    const { texSize, context: gl } = this;
+    const w = texSize[0];
+    const h = texSize[1];
+    let format, type, result;
+    if (this.precision === 'single') {
+      format = this._tightRead ? gl.RED : gl.RGBA;
+      type = gl.FLOAT;
+      result = new Float32Array(w * h * (this._tightRead ? 1 : 4));
+    } else {
+      format = gl.RGBA;
+      type = gl.UNSIGNED_BYTE;
+      result = new Uint8Array(w * h * 4);
+    }
+    const pbo = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, result.byteLength, gl.STREAM_READ);
+    gl.readPixels(0, 0, w, h, format, type, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    // fences are queued, not submitted; without a flush the poll can spin
+    // forever waiting on commands the driver never dispatched
+    gl.flush();
+    return this._pollFence(sync).then(() => {
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, result);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      gl.deleteBuffer(pbo);
+      return this.precision === 'single' ? result : new Float32Array(result.buffer);
+    }, (error) => {
+      gl.deleteBuffer(pbo);
+      throw error;
+    });
+  }
+
+  _pollFence(sync) {
+    const gl = this.context;
+    return new Promise((resolve, reject) => {
+      // repolling through a MessageChannel task rather than setTimeout: each
+      // check is its own event-loop turn (other work interleaves freely) but
+      // skips the nested-timeout clamp, which would tax every readback with
+      // multiple 4 ms waits after the GPU had already finished
+      let schedule;
+      let channel = null;
+      if (typeof MessageChannel !== 'undefined') {
+        channel = new MessageChannel();
+        channel.port1.onmessage = () => poll();
+        schedule = () => channel.port2.postMessage(0);
+      } else {
+        schedule = () => setTimeout(poll, 0);
+      }
+      const settle = (fn, value) => {
+        gl.deleteSync(sync);
+        if (channel) {
+          channel.port1.close();
+          channel.port2.close();
+        }
+        fn(value);
+      };
+      const poll = () => {
+        if (gl.isContextLost()) {
+          return settle(reject, new Error('WebGL context lost while awaiting kernel result'));
+        }
+        // always zero timeout: a wait would block the very thread this exists
+        // to keep free
+        const status = gl.clientWaitSync(sync, 0, 0);
+        if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+          return settle(resolve);
+        }
+        if (status === gl.WAIT_FAILED) {
+          return settle(reject, new Error('clientWaitSync failed while awaiting kernel result'));
+        }
+        schedule();
+      };
+      poll();
+    });
+  }
+
+  _detectTightRead() {
+    const gl = this.context;
+    this._tightRead = false;
+    // the implementation read format is a property of the bound READ
+    // framebuffer; callers reach here with varying binding state (the
+    // inherit path of _setupOutputTexture never binds), so bind explicitly
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
+    const scalarReturn =
+      this.returnType === 'Number' ||
+      this.returnType === 'Float' ||
+      this.returnType === 'Integer' ||
+      this.returnType === 'LiteralInteger';
+    if (this.precision !== 'single' || this.optimizeFloatMemory || this.graphical || !scalarReturn) return;
+    if (
+      gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT) !== gl.RED ||
+      gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE) !== gl.FLOAT
+    ) {
+      return;
+    }
+    // The tight buffer is stride 1, which is exactly the layout the
+    // memory-optimized erect family describes. Detection re-runs whenever the
+    // output texture is set up again (setOutput, kernel switching), so an
+    // already-swapped erect function counts as tight-ready -- bailing on it
+    // would strand a stride-1 formatter on the stride-4 fallback read.
+    if (this.formatValues === utils.erectFloat) {
+      this.formatValues = utils.erectMemoryOptimizedFloat;
+    } else if (this.formatValues === utils.erect2DFloat) {
+      this.formatValues = utils.erectMemoryOptimized2DFloat;
+    } else if (this.formatValues === utils.erect3DFloat) {
+      this.formatValues = utils.erectMemoryOptimized3DFloat;
+    } else if (
+      this.formatValues !== utils.erectMemoryOptimizedFloat &&
+      this.formatValues !== utils.erectMemoryOptimized2DFloat &&
+      this.formatValues !== utils.erectMemoryOptimized3DFloat
+    ) {
+      return;
+    }
+    this._tightRead = true;
+  }
+
   getInternalFormat() {
     const { context: gl } = this;
 
     if (this.precision === 'single') {
-      if (this.pipeline) {
-        switch (this.returnType) {
-          case 'Number':
-          case 'Float':
-          case 'Integer':
-            if (this.optimizeFloatMemory) {
-              return gl.RGBA32F;
-            } else {
-              return gl.R32F;
-            }
-          case 'Array(2)':
-            return gl.RG32F;
-          case 'Array(3)': // there is _no_ 3 channel format which is guaranteed to be color-renderable
-          case 'Array(4)':
+      // The same tight formats whether or not the kernel pipelines: a scalar
+      // kernel rendering to RGBA32F writes one channel and drags three dead
+      // ones through the render target -- a 4x bandwidth tax on memory-bound
+      // kernels. Reading back stays RGBA/FLOAT either way, which the spec
+      // guarantees for every float color buffer, so only the attachment
+      // narrows. optimizeFloatMemory genuinely fills all four channels and
+      // keeps RGBA32F.
+      switch (this.returnType) {
+        case 'Number':
+        case 'Float':
+        case 'Integer':
+          if (this.optimizeFloatMemory) {
             return gl.RGBA32F;
-          default:
-            throw new Error('Unhandled return type');
-        }
+          } else {
+            return gl.R32F;
+          }
+        case 'Array(2)':
+          return gl.RG32F;
+        case 'Array(3)': // there is _no_ 3 channel format which is guaranteed to be color-renderable
+        case 'Array(4)':
+          return gl.RGBA32F;
+        default:
+          throw new Error('Unhandled return type');
       }
-      return gl.RGBA32F;
     }
     return gl.RGBA;
   }
@@ -280,6 +471,7 @@ class WebGL2Kernel extends WebGLKernel {
     if (this.texture) {
       // here we inherit from an already existing kernel, so go ahead and just bind textures to the framebuffer
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture.texture, 0);
+      this._tightRead = undefined;
       return;
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
@@ -308,6 +500,7 @@ class WebGL2Kernel extends WebGLKernel {
       textureFormat: this.getTextureFormat(),
       kernel: this,
     });
+    this._tightRead = undefined;
   }
 
   _setupSubOutputTextures() {

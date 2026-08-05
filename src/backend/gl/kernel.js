@@ -398,7 +398,8 @@ class GLKernel extends Kernel {
           case 'Array(2)':
           case 'Array(3)':
           case 'Array(4)':
-            return this.requestFallback(args);
+            return this.requestFallback(args,
+              `${ this.returnType } output requires single precision, which this context does not support`);
         }
       } else {
         if (this.subKernels !== null) {
@@ -426,7 +427,8 @@ class GLKernel extends Kernel {
           case 'Array(2)':
           case 'Array(3)':
           case 'Array(4)':
-            return this.requestFallback(args);
+            return this.requestFallback(args,
+              `${ this.returnType } output requires single precision, which this context does not support`);
         }
       }
     } else if (this.precision === 'single') {
@@ -848,7 +850,9 @@ class GLKernel extends Kernel {
   /**
    *
    * @param {Boolean} [flip]
-   * @return {Uint8ClampedArray}
+   * @return {Uint8ClampedArray|Promise<Uint8ClampedArray>} a Promise under
+   *   the async contract, so `await kernel.getPixels()` is portable across
+   *   every backend including webgpu, where the readback is genuinely async
    */
   getPixels(flip) {
     const {
@@ -859,7 +863,8 @@ class GLKernel extends Kernel {
     const pixels = new Uint8Array(width * height * 4);
     gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     // flipped by default, so invert
-    return new Uint8ClampedArray((flip ? pixels : utils.flipPixels(pixels, width, height)).buffer);
+    const result = new Uint8ClampedArray((flip ? pixels : utils.flipPixels(pixels, width, height)).buffer);
+    return this.asyncMode ? Promise.resolve(result) : result;
   }
 
   renderKernelsToArrays() {
@@ -888,11 +893,6 @@ class GLKernel extends Kernel {
     return result;
   }
 
-  resetSwitchingKernels() {
-    const existingValue = this.switchingKernels;
-    this.switchingKernels = null;
-    return existingValue;
-  }
 
   setOutput(output) {
     const newOutput = this.toKernelOutput(output);
@@ -956,13 +956,6 @@ class GLKernel extends Kernel {
       this.output[1],
       this.output[2]
     );
-  }
-  switchKernels(reason) {
-    if (this.switchingKernels) {
-      this.switchingKernels.push(reason);
-    } else {
-      this.switchingKernels = [reason];
-    }
   }
   getVariablePrecisionString(textureSize = this.texSize, tactic = this.tactic, isInt = false) {
     if (!tactic) {

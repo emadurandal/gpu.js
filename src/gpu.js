@@ -5,14 +5,18 @@ const { CPUKernel } = require('./backend/cpu/kernel');
 const { HeadlessGLKernel } = require('./backend/headless-gl/kernel');
 const { WebGL2Kernel } = require('./backend/web-gl2/kernel');
 const { WebGLKernel } = require('./backend/web-gl/kernel');
+const { WebGPUKernel } = require('./backend/web-gpu/kernel');
+const { WebAssemblyKernel } = require('./backend/web-assembly/kernel');
 const { kernelRunShortcut } = require('./kernel-run-shortcut');
+const { Pipeline } = require('./pipeline');
 
 
 /**
- *
+ * webasm sits last, one step above the cpu fallback: any working GL backend
+ * outranks it, so auto modes only reach it where no GL context exists
  * @type {Array.<Kernel>}
  */
-const kernelOrder = [HeadlessGLKernel, WebGL2Kernel, WebGLKernel];
+const kernelOrder = [HeadlessGLKernel, WebGL2Kernel, WebGLKernel, WebAssemblyKernel];
 
 /**
  *
@@ -24,6 +28,11 @@ const internalKernels = {
   'headlessgl': HeadlessGLKernel,
   'webgl2': WebGL2Kernel,
   'webgl': WebGLKernel,
+  // deliberately NOT in kernelOrder: the sync isSupported check
+  // (navigator.gpu presence) does not prove an adapter exists, so webgpu is
+  // explicit opt-in via `new GPU({ mode: 'webgpu' })` only
+  'webgpu': WebGPUKernel,
+  'webasm': WebAssemblyKernel,
 };
 
 let validate = true;
@@ -83,6 +92,32 @@ class GPU {
   }
 
   /**
+   * @desc TRUE if the WebGPU API surface exists (navigator.gpu). Optimistic:
+   * an adapter may still be unavailable — use `await GPU.isWebGPUAvailable()`
+   * for the authoritative answer.
+   */
+  static get isWebGPUSupported() {
+    return WebGPUKernel.isSupported;
+  }
+
+  /**
+   * @desc Actually requests an adapter; resolves whether a webgpu kernel
+   * could run here.
+   * @returns {Promise<boolean>}
+   */
+  static isWebGPUAvailable() {
+    if (!WebGPUKernel.isSupported) return Promise.resolve(false);
+    return navigator.gpu.requestAdapter().then(adapter => adapter !== null, () => false);
+  }
+
+  /**
+   * @desc TRUE if platform supports WebAssembly
+   */
+  static get isWebAssemblySupported() {
+    return WebAssemblyKernel.isSupported;
+  }
+
+  /**
    *
    * @desc TRUE if platform supports Canvas
    */
@@ -116,7 +151,29 @@ class GPU {
     this.context = settings.context || null;
     this.mode = settings.mode;
     this.Kernel = null;
+    /**
+     * mode 'async' only: the adapter probe's settled answer (true/false), or
+     * null while it is in flight. Started at construction so that by kernel
+     * creation -- usually at least a task later in real applications -- the
+     * backend for a graphical kernel can be decided BEFORE its canvas is
+     * exposed, since a canvas is permanently committed to its first context
+     * type and can never be swapped between backends afterwards.
+     * @type {Boolean|null}
+     */
+    this._webGPUDecision = null;
+    if (settings.mode === 'async') {
+      if (WebGPUKernel.isSupported) {
+        GPU.isWebGPUAvailable().then(available => {
+          this._webGPUDecision = available;
+        }, () => {
+          this._webGPUDecision = false;
+        });
+      } else {
+        this._webGPUDecision = false;
+      }
+    }
     this.kernels = [];
+    this.pipelines = [];
     this.functions = [];
     this.nativeFunctions = [];
     this.injectedNative = null;
@@ -178,6 +235,21 @@ class GPU {
             break;
           }
         }
+      } else if (this.mode === 'async') {
+        // auto-selection under the Promise contract: pick the best
+        // synchronously-provable backend now (its readback runs non-blocking
+        // where the platform allows), and let the first kernel call upgrade
+        // to webgpu once an adapter has actually answered -- the async
+        // contract is exactly what buys the room to probe
+        for (let i = 0; i < kernelOrder.length; i++) {
+          if (kernelOrder[i].isSupported) {
+            Kernel = kernelOrder[i];
+            break;
+          }
+        }
+        if (!Kernel) {
+          Kernel = CPUKernel;
+        }
       } else if (this.mode === 'cpu') {
         Kernel = CPUKernel;
       }
@@ -231,8 +303,10 @@ class GPU {
       settingsCopy.argumentTypes = Object.keys(settings.argumentTypes).map(argumentName => settings.argumentTypes[argumentName]);
     }
 
+    const gpuInstance = this;
+
     function onRequestFallback(args) {
-      console.warn('Falling back to CPU');
+      console.warn(`Falling back to CPU${ kernelRun.fallbackReason ? `: ${ kernelRun.fallbackReason }` : '' }`);
       const fallbackKernel = new CPUKernel(source, {
         argumentTypes: kernelRun.argumentTypes,
         constantTypes: kernelRun.constantTypes,
@@ -252,11 +326,36 @@ class GPU {
         injectedNative: kernelRun.injectedNative,
         subKernels: kernelRun.subKernels,
         strictIntegers: kernelRun.strictIntegers,
+        randomSeed: kernelRun.randomSeed,
         debug: kernelRun.debug,
+        asyncMode: kernelRun.asyncMode,
+        // the fallback kernel lives as long as the shortcut: without these
+        // hooks a later argument-type change on it throws instead of
+        // switching (the run shortcut assumes every kernel carries them)
+        onRequestFallback,
+        onRequestSwitchKernel,
+        // ONLY a graphical fallback whose canvas is still uncommitted (webasm
+        // creates the element but never touches a context) inherits it, so
+        // the element the user appended keeps rendering. Any canvas that
+        // already has a rendering context -- every GL kernel's -- is
+        // permanently committed to it and would break the cpu kernel's 2d
+        // context instead.
+        canvas: kernelRun.graphical && !kernelRun.context ? kernelRun.canvas : null,
       });
+      // the requesting kernel is about to be swapped out; the reason stays
+      // queryable on the kernel that survives
+      fallbackKernel.fallbackReason = kernelRun.fallbackReason;
       fallbackKernel.build.apply(fallbackKernel, args);
       const result = fallbackKernel.run.apply(fallbackKernel, args);
       kernelRun.replaceKernel(fallbackKernel);
+      // gpu.canvas was sampled once at createKernel, possibly from a kernel
+      // with no canvas; the fallback may be the first to have one
+      if (!gpuInstance.canvas && fallbackKernel.canvas) {
+        gpuInstance.canvas = fallbackKernel.canvas;
+      }
+      if (!gpuInstance.context && fallbackKernel.context) {
+        gpuInstance.context = fallbackKernel.context;
+      }
       return result;
     }
 
@@ -314,7 +413,9 @@ class GPU {
         injectedNative: _kernel.injectedNative,
         subKernels: _kernel.subKernels,
         strictIntegers: _kernel.strictIntegers,
+        randomSeed: _kernel.randomSeed,
         debug: _kernel.debug,
+        asyncMode: _kernel.asyncMode,
         gpu: _kernel.gpu,
         validate,
         returnType: _kernel.returnType,
@@ -341,9 +442,122 @@ class GPU {
       onRequestFallback,
       onRequestSwitchKernel
     }, settingsCopy);
+    if (this.mode === 'async') {
+      mergedSettings.asyncMode = true;
+    }
 
-    const kernel = new this.Kernel(source, mergedSettings);
+    let ChosenKernel = this.Kernel;
+    if (this.mode === 'async' && settingsCopy.graphical && this._webGPUDecision === true) {
+      // graphical kernels bind to their backend at creation: the canvas the
+      // user appends must be the final one. The probe settled webgpu-yes, so
+      // construct there directly -- no upgrade, no canvas swap, ever. A
+      // still-pending probe (kernel created in the same tick as the GPU)
+      // stays on the proven backend; `await GPU.isWebGPUAvailable()` before
+      // createKernel settles it deterministically.
+      ChosenKernel = WebGPUKernel;
+      // the GPU instance's shared canvas/context belong to the GL backend;
+      // a webgpu kernel must not inherit them
+      if (mergedSettings.canvas === this.canvas) mergedSettings.canvas = settingsCopy.canvas || null;
+      if (mergedSettings.context === this.context) mergedSettings.context = settingsCopy.context || null;
+      mergedSettings.asyncMode = true;
+    }
+    let kernel;
+    try {
+      kernel = new ChosenKernel(source, mergedSettings);
+    } catch (e) {
+      if (ChosenKernel !== this.Kernel) {
+        // anything the webgpu backend cannot take falls back to the proven
+        // backend at construction, exactly as the upgrade path declines
+        kernel = new this.Kernel(source, Object.assign({}, mergedSettings, {
+          canvas: this.canvas,
+          context: this.context,
+        }));
+      } else {
+        throw e;
+      }
+    }
     const kernelRun = kernelRunShortcut(kernel);
+
+    if (this.mode === 'async' && WebGPUKernel.isSupported && !(kernel instanceof WebGPUKernel)) {
+      const gpu = this;
+      // consulted (and cleared) by the shortcut on the first call, before the
+      // chosen kernel builds; every setter chained onto the shortcut lands on
+      // the kernel instance first, so its settings are harvested here rather
+      // than from settingsCopy
+      kernel.onAsyncModeUpgrade = function onAsyncModeUpgrade(args, currentKernel) {
+        return GPU.isWebGPUAvailable().then(available => {
+          if (!available) return null;
+          if (currentKernel.graphical) {
+            // the webgpu backend can render, but upgrading would swap in a
+            // different canvas element -- one the user may already have in
+            // the DOM -- so graphical kernels stay where they started
+            if (currentKernel.debug) {
+              console.warn('webgpu upgrade declined: graphical kernels keep their canvas');
+            }
+            return null;
+          }
+          let webGPUKernel;
+          try {
+            webGPUKernel = new WebGPUKernel(source, {
+              // from the kernel instance, not the GPU: per-kernel functions
+              // (createKernel settings, addFunction on the shortcut) live
+              // only on the kernel, and losing them here would silently
+              // decline the upgrade forever
+              functions: currentKernel.functions,
+              nativeFunctions: currentKernel.nativeFunctions,
+              injectedNative: currentKernel.injectedNative,
+              gpu,
+              validate,
+              asyncMode: true,
+              output: currentKernel.output,
+              pipeline: currentKernel.pipeline,
+              immutable: currentKernel.immutable,
+              dynamicOutput: currentKernel.dynamicOutput,
+              // always dynamic: the GL backends absorb argument-size changes
+              // by switching kernels, so a faithful harvest here would make
+              // the upgrade stricter than the backend it replaced. The WGSL
+              // side reads every array's dimensions from the params buffer
+              // regardless, so the leniency costs nothing.
+              dynamicArguments: true,
+              loopMaxIterations: currentKernel.loopMaxIterations,
+              constants: currentKernel.constants,
+              constantTypes: currentKernel.constantTypes,
+              argumentTypes: currentKernel.argumentTypes,
+              precision: currentKernel.precision,
+              tactic: currentKernel.tactic,
+              strictIntegers: currentKernel.strictIntegers,
+              fixIntegerDivisionAccuracy: currentKernel.fixIntegerDivisionAccuracy,
+              subKernels: currentKernel.subKernels,
+              graphical: currentKernel.graphical,
+              debug: currentKernel.debug,
+            });
+            // deferred features (graphical, kernel maps, unsigned precision,
+            // Math.random) throw synchronously here: the proven backend keeps
+            // the kernel and nothing was lost but the probe
+            webGPUKernel.build.apply(webGPUKernel, args);
+          } catch (e) {
+            if (currentKernel.debug) {
+              console.warn('webgpu upgrade declined: ' + e.message);
+            }
+            return null;
+          }
+          // WGSL compilation and pipeline validation reject asynchronously;
+          // awaiting the full build here means the kernel only ever swaps to
+          // a webgpu kernel that is proven to build, and a declined upgrade
+          // keeps the real reason instead of masking it behind a re-run
+          return webGPUKernel._buildPromise.then(() => {
+            kernels.push(webGPUKernel);
+            return webGPUKernel;
+          }, (e) => {
+            if (currentKernel.debug) {
+              console.warn('webgpu upgrade declined: ' + e.message);
+            }
+            webGPUKernel.destroy();
+            return null;
+          });
+        }, () => null);
+      };
+    }
 
     //if canvas didn't come from this, propagate from kernel
     if (!this.canvas) {
@@ -358,6 +572,69 @@ class GPU {
     kernels.push(kernel);
 
     return kernelRun;
+  }
+
+  /**
+   * @desc Compile a whole multi-kernel computation into one callable plan
+   * (docs/design/pipeline-compilation.md). The orchestration function runs
+   * once, at build time, with opaque handles for arguments; the kernel calls
+   * it makes are recorded and replayed on later calls with intermediates
+   * kept resident. Calling the pipeline always returns a Promise.
+   * @param {Function} fn - orchestration function; may only call kernels
+   * created by this GPU instance
+   * @param {IPipelineSettings} [settings] - `constants` only in v1
+   * @returns {IPipelineRunShortcut} callable pipeline
+   */
+  createPipeline(fn, settings) {
+    if (typeof fn !== 'function') {
+      throw new Error('createPipeline requires an orchestration function');
+    }
+    if (this.mode === 'dev') {
+      throw new Error('createPipeline is not supported in dev mode');
+    }
+    const pipeline = new Pipeline(this, fn, settings);
+    this.pipelines.push(pipeline);
+    const shortcut = function() {
+      return pipeline.call(arguments);
+    };
+    shortcut.pipeline = pipeline;
+    shortcut.setConstants = function(constants) {
+      pipeline.setConstants(constants);
+      return shortcut;
+    };
+    shortcut.destroy = function() {
+      return pipeline.destroy();
+    };
+    Object.defineProperty(shortcut, 'executorKind', {
+      get: () => pipeline.executorKind,
+    });
+    Object.defineProperty(shortcut, 'fallbackReason', {
+      get: () => pipeline.fallbackReason,
+    });
+    Object.defineProperty(shortcut, 'plan', {
+      get: () => pipeline.plan,
+    });
+    // the backend that actually EXECUTES, derived from the executor that
+    // ran -- never from plan internals, which reorganize between releases.
+    // Under degradation inside the generic executor the writer clones swap
+    // to cpu and this says so: the silent-degradation safety net suites
+    // probe on kernels (#868), as supported API.
+    Object.defineProperty(shortcut, 'backend', {
+      get: () => {
+        const kind = pipeline.executorKind;
+        if (kind === 'fused-sync' || kind === 'fused-threaded') return 'webasm';
+        if (kind === 'fused-encoder') return 'webgpu';
+        const plan = pipeline.plan;
+        if (!plan) return null;
+        for (const [key, clone] of plan.genericClones) {
+          if (key.indexOf('up:') !== 0) return clone.kernel.constructor.mode;
+        }
+        // built but no generic run yet: the plan clones' mode is the
+        // backend a run WOULD execute on
+        return plan.kernels.length > 0 ? plan.kernels[0].clone.kernel.constructor.mode : null;
+      },
+    });
+    return shortcut;
   }
 
   /**
@@ -403,7 +680,16 @@ class GPU {
 
     if (this.mode !== 'dev') {
       if (!this.Kernel.isSupported || !this.Kernel.features.kernelMap) {
-        if (this.mode && kernelTypes.indexOf(this.mode) < 0) {
+        if (this.Kernel.mode === 'webgpu') {
+          throw new Error('WebGPU backend does not yet support createKernelMap');
+        }
+        // webasm sits in the auto chain one step above cpu; its build()
+        // degrades kernel maps to cpu via requestFallback, so throwing here
+        // would remove the cpu fallback from exactly the GL-less environments
+        // the backend exists for. chooseKernel rewrites this.mode to the
+        // chosen backend's name, so the mode check alone cannot tell an
+        // explicit request from auto-selection -- let webasm fall through.
+        if (this.mode && kernelTypes.indexOf(this.mode) < 0 && this.Kernel.mode !== 'webasm') {
           throw new Error(`kernelMap not supported on ${this.Kernel.name}`);
         }
       }
@@ -468,7 +754,16 @@ class GPU {
   combineKernels() {
     const firstKernel = arguments[0];
     const combinedKernel = arguments[arguments.length - 1];
+    // before the cpu early-return: the cpu arm of mode 'async' is equally
+    // Promise-returning, and the combiner would feed those Promises into the
+    // next kernel as arguments
+    if (this.mode === 'async' || firstKernel.kernel.asyncMode) {
+      throw new Error(`mode 'async' does not yet support combineKernels; chain kernels with \`await\` and pipeline mode instead`);
+    }
     if (firstKernel.kernel.constructor.mode === 'cpu') return combinedKernel;
+    if (firstKernel.kernel.constructor.mode === 'webgpu') {
+      throw new Error('WebGPU backend does not yet support combineKernels; chain kernels with `await` and pipeline mode instead');
+    }
     const canvas = arguments[0].canvas;
     const context = arguments[0].context;
     const max = arguments.length - 1;
@@ -549,24 +844,51 @@ class GPU {
       // if webGl is created and destroyed in the same run loop.
       setTimeout(() => {
         try {
-          for (let i = 0; i < this.kernels.length; i++) {
-            this.kernels[i].destroy(true); // remove canvas if exists
+          // pipelines release their cloned kernel instances, which splice
+          // themselves out of this.kernels -- so pipelines go first, then
+          // the surviving kernels. Their releases queue behind in-flight
+          // call tails, so the whole teardown AWAITS them: gpu.destroy()
+          // resolving while a threaded executor's workers are still alive
+          // is a lie the caller acts on
+          let pipelinesDone = Promise.resolve();
+          if (this.pipelines) {
+            const pipelines = this.pipelines.slice();
+            pipelinesDone = Promise.all(pipelines.map(pipeline => Promise.resolve(pipeline.destroy()).catch(() => undefined)));
           }
-          // all kernels are associated with one context, go ahead and take care of it here
-          let firstKernel = this.kernels[0];
-          if (firstKernel) {
-            // if it is shortcut
-            if (firstKernel.kernel) {
-              firstKernel = firstKernel.kernel;
+          // a closure, not a method: destroy() is exercised against bare
+          // mock objects via GPU.prototype.destroy.call in the test suite,
+          // so `this` cannot be assumed to carry anything beyond data
+          const destroyKernels = () => {
+            try {
+              // kernel.destroy() splices itself out of this.kernels, so walk a copy:
+              // mutating the list being indexed skipped every other kernel, and left
+              // this.kernels[0] undefined below, which meant a single-kernel GPU
+              // never released its WebGL context at all
+              const kernels = this.kernels.slice();
+              for (let i = 0; i < kernels.length; i++) {
+                kernels[i].destroy(true); // remove canvas if exists
+              }
+              // all kernels are associated with one context, go ahead and take care of it here
+              let firstKernel = kernels[0];
+              if (firstKernel) {
+                // if it is shortcut
+                if (firstKernel.kernel) {
+                  firstKernel = firstKernel.kernel;
+                }
+                if (firstKernel.constructor.destroyContext) {
+                  firstKernel.constructor.destroyContext(this.context);
+                }
+              }
+            } catch (e) {
+              reject(e);
+              return;
             }
-            if (firstKernel.constructor.destroyContext) {
-              firstKernel.constructor.destroyContext(this.context);
-            }
-          }
+            resolve();
+          };
+          pipelinesDone.then(destroyKernels).catch(reject);
         } catch (e) {
           reject(e);
         }
-        resolve();
       }, 0);
     });
   }

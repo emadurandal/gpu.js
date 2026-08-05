@@ -122,6 +122,45 @@ const utils = {
    * @param {boolean} [strictIntegers]
    * @returns {String}  Argument type Array/Number/Float/Texture/Unknown
    */
+  /**
+   * @desc Can a value still be used as the argument type a kernel was built
+   * for? Deliberately loose: a declared type is often more specific than
+   * detection can be (Array1D(2) reads as a plain Array), so this only
+   * reports the fundamental mismatches -- a number where an array is
+   * expected, an Input where a plain array is, a plain array where a texture
+   * is. Those are the changes that need a differently-compiled kernel.
+   * @param {String} type
+   * @param {*} value
+   * @returns {Boolean}
+   */
+  typeFitsValue(type, value) {
+    if (typeof type !== 'string' || value === null || value === undefined) return true;
+    // a value that names its own type (textures, pipeline buffers) is already
+    // re-mapped over the declared type by the kernel-value lookup and by the
+    // GL backends' own mismatch detection; the declared type does not govern
+    // it and second-guessing that here only fights machinery that works
+    if (value.type) return true;
+    switch (type) {
+      case 'Input':
+        return value instanceof Input;
+      case 'Boolean':
+        return typeof value === 'boolean';
+      case 'Number':
+      case 'Integer':
+      case 'Float':
+        return typeof value === 'number';
+    }
+    if (type.indexOf('Texture') !== -1) {
+      return Boolean(value.type);
+    }
+    if (type.indexOf('Array') === 0) {
+      return utils.isArray(value);
+    }
+    // HTMLImage, HTMLVideo, ImageBitmap, OffscreenCanvas, Unknown: detection
+    // adds nothing the declared type does not already say
+    return true;
+  },
+
   getVariableType(value, strictIntegers) {
     if (utils.isArray(value)) {
       if (value.length > 0 && value[0].nodeName === 'IMG') {
@@ -340,7 +379,20 @@ const utils = {
     return result;
   },
 
+  /**
+   * A number as a GLSL float literal. Integer-valued numbers at 1e21 and
+   * beyond stringify in exponential form, which is already a valid GLSL
+   * float literal — appending .0 to it is not (#864).
+   */
+  glslFloatLiteral(value) {
+    const str = `${ value }`;
+    return /[.eE]/.test(str) ? str : `${ str }.0`;
+  },
+
   getAstString(source, ast) {
+    // synthetic nodes (loop normalization) carry no loc; a diagnostic on one
+    // must still report rather than crash the error path itself
+    if (!ast.loc) return '[synthetic node]';
     const lines = Array.isArray(source) ? source : source.split(/\r?\n/g);
     const start = ast.loc.start;
     const end = ast.loc.end;
@@ -630,7 +682,9 @@ const utils = {
     if (!flattened) {
       flattened = settings.flattened = {};
     }
-    const ast = acorn.parse(source);
+    // acorn 8 requires ecmaVersion and warns when it is absent; 2020 is the
+    // version it defaults to, so this pins current behaviour rather than changing it
+    const ast = acorn.parse(source, { ecmaVersion: 2020 });
     const functionDependencies = [];
     let indent = 0;
 
@@ -669,6 +723,11 @@ const utils = {
             return `${ast.kind} ${declarations.join(',')}`;
           }
         case 'VariableDeclarator':
+          // a declaration with no initializer (`let x;`) has a null init, so
+          // there is nothing to flatten and nothing to look up on `this`
+          if (!ast.init) {
+            return ast.id.name;
+          }
           if (ast.init.object && ast.init.object.type === 'ThisExpression') {
             const lookup = thisLookup(ast.init.property.name, true);
             if (lookup) {
@@ -743,8 +802,19 @@ const utils = {
           return `${flatten(ast.left)}${ast.operator}${flatten(ast.right)}`;
         case 'UpdateExpression':
           return `${flatten(ast.argument)}${ast.operator}`;
-        case 'IfStatement':
-          return `if (${flatten(ast.test)}) ${flatten(ast.consequent)}`;
+        case 'IfStatement': {
+          // the else branch is semantics, not decoration — dropping it produced
+          // kernel strings that still parsed and ran, and returned garbage
+          const consequent = flatten(ast.consequent);
+          if (!ast.alternate) {
+            return `if (${flatten(ast.test)}) ${consequent}`;
+          }
+          // a consequent that is not a block (`if (x) return 1;`) needs the
+          // semicolon the enclosing block would have added, or `else` follows
+          // an unterminated statement
+          const terminator = ast.consequent.type === 'BlockStatement' ? '' : ';';
+          return `if (${flatten(ast.test)}) ${consequent}${terminator} else ${flatten(ast.alternate)}`;
+        }
         case 'ThrowStatement':
           return `throw ${flatten(ast.argument)}`;
         case 'ObjectPattern':
@@ -985,7 +1055,7 @@ const utils = {
 
   getMinifySafeName: (fn) => {
     try {
-      const ast = acorn.parse(`const value = ${fn.toString()}`);
+      const ast = acorn.parse(`const value = ${fn.toString()}`, { ecmaVersion: 2020 });
       const { init } = ast.body[0].declarations[0];
       return init.body.name || init.body.body[0].argument.name;
     } catch (e) {

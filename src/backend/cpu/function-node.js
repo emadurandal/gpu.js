@@ -12,6 +12,21 @@ class CPUFunctionNode extends FunctionNode {
    * @param {Array} retArr - return array string
    * @returns {Array} the append retArr
    */
+  /**
+   * @desc The generated cell loop binds arguments once for the whole run, so
+   * an assignment would leak into every later cell (#865); assigned arguments
+   * get a per-cell shadow local instead. The cpu backend never sanitizes
+   * names, so the shadow lives OUTSIDE the `user_` namespace (like the GL
+   * backends' `cellShadow_`): a `$cell` suffix could collide with a user
+   * identifier literally named that.
+   */
+  markupUserName(name) {
+    if (this.isRootKernel && this.getAssignedArguments().has(name)) {
+      return `cellShadow_user_${ name }`;
+    }
+    return `user_${ name }`;
+  }
+
   astFunction(ast, retArr) {
 
     // Setup function return type and name
@@ -36,10 +51,23 @@ class CPUFunctionNode extends FunctionNode {
       retArr.push(') {\n');
     }
 
+    if (this.isRootKernel) {
+      for (const name of this.getAssignedArguments()) {
+        retArr.push(`let cellShadow_user_${ name } = user_${ name };\n`);
+      }
+      // an early return breaks out of this block -- a plain `continue` only
+      // reaches the cell loop from the body's top level, so a return inside
+      // a user loop used to fall through and let later statements overwrite
+      // the result (#865)
+      retArr.push('kernelBody: {\n');
+    }
     // Body statement iteration
     for (let i = 0; i < ast.body.body.length; ++i) {
       this.astGeneric(ast.body.body[i], retArr);
       retArr.push('\n');
+    }
+    if (this.isRootKernel) {
+      retArr.push('}\n');
     }
 
     if (!this.isRootKernel) {
@@ -67,7 +95,7 @@ class CPUFunctionNode extends FunctionNode {
       this.astGeneric(ast.argument, retArr);
       retArr.push(';\n');
       retArr.push(this.followingReturnStatement);
-      retArr.push('continue;\n');
+      retArr.push('break kernelBody;\n');
     } else if (this.isSubKernel) {
       retArr.push(`subKernelResult_${ this.name } = `);
       this.astGeneric(ast.argument, retArr);
@@ -136,8 +164,23 @@ class CPUFunctionNode extends FunctionNode {
         retArr.push('Infinity');
         break;
       default:
-        if (this.constants && this.constants.hasOwnProperty(idtNode.name)) {
+        // A local binding wins over a constant of the same name, the way it
+        // does in JavaScript. Classifying by spelling alone renamed a kernel
+        // local `n` to `constants_n` in its own declarator, so
+        // `const n = this.constants.n` emitted `const constants_n =
+        // constants_n` and died in the temporal dead zone. `this.constants.n`
+        // itself never reaches here -- astMemberExpression emits it.
+        if (
+          !this.getDeclaration(idtNode) &&
+          this.constants && this.constants.hasOwnProperty(idtNode.name)
+        ) {
           retArr.push('constants_' + idtNode.name);
+        } else if (
+          !this.getDeclaration(idtNode) &&
+          this.isRootKernel && this.getAssignedArguments().has(idtNode.name)
+        ) {
+          // an assigned argument reads and writes its per-cell shadow (#865)
+          retArr.push(this.markupUserName(idtNode.name));
         } else {
           retArr.push('user_' + idtNode.name);
         }
@@ -183,6 +226,9 @@ class CPUFunctionNode extends FunctionNode {
     }
 
     if (forNode.update) {
+      if (forNode.update.type === 'AssignmentExpression') {
+        this.pushState('assignment-as-statement');
+      }
       this.astGeneric(forNode.update, updateArr);
     } else {
       isSafe = false;
@@ -260,14 +306,16 @@ class CPUFunctionNode extends FunctionNode {
       );
     }
 
-    retArr.push('for (let i = 0; i < LOOP_MAX; i++) {');
+    // a native do-while: `continue` must jump to the test, which the old
+    // for-wrapped form skipped (#865). The iteration cap rides in the
+    // condition; the counter name is keyed to the node so nesting works.
+    const safeName = `safeI${ this.astKey(doWhileNode, '_') }`;
+    retArr.push(`let ${ safeName } = 0;\n`);
+    retArr.push('do {');
     this.astGeneric(doWhileNode.body, retArr);
-    retArr.push('if (!');
+    retArr.push('} while ((');
     this.astGeneric(doWhileNode.test, retArr);
-    retArr.push(') {\n');
-    retArr.push('break;\n');
-    retArr.push('}\n');
-    retArr.push('}\n');
+    retArr.push(`) && ++${ safeName } < LOOP_MAX);\n`);
 
     return retArr;
 
@@ -280,13 +328,24 @@ class CPUFunctionNode extends FunctionNode {
    * @returns {Array} the append retArr
    */
   astAssignmentExpression(assNode, retArr) {
-    const declaration = this.getDeclaration(assNode.left);
-    if (declaration && !declaration.assignable) {
-      throw this.astErrorOutput(`Variable ${assNode.left.name} is not assignable here`, assNode);
+    // assigning to a for-init variable (an inner `for (i = 0; ...)` reusing
+    // an outer counter, say) is legal JavaScript and the emitted JS runs it
+    // with JavaScript's exact semantics -- the old "not assignable here"
+    // throw guarded a GL grammar restriction the GL emitter now handles
+    // itself by un-safing the loop (#860)
+    // see the WebGL emitter: subexpression assignments need parens (#854)
+    const isStatement = this.isState('assignment-as-statement');
+    if (isStatement) {
+      this.popState('assignment-as-statement');
+    } else {
+      retArr.push('(');
     }
     this.astGeneric(assNode.left, retArr);
     retArr.push(assNode.operator);
     this.astGeneric(assNode.right, retArr);
+    if (!isStatement) {
+      retArr.push(')');
+    }
     return retArr;
   }
 
@@ -499,14 +558,14 @@ class CPUFunctionNode extends FunctionNode {
         case 'Integer':
         case 'Float':
         case 'Boolean':
-          retArr.push(`${origin}_${name}`);
+          retArr.push(origin === 'user' ? this.markupUserName(name) : `${origin}_${name}`);
           return retArr;
       }
     }
 
     // handle more complex types
     // argument may have come from a parent
-    const markupName = `${origin}_${name}`;
+    const markupName = origin === 'user' ? this.markupUserName(name) : `${origin}_${name}`;
 
     switch (type) {
       case 'Array(2)':

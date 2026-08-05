@@ -10,6 +10,19 @@ class WebGLKernelArray extends WebGLKernelValue {
    * @param {number} width
    * @param {number} height
    */
+  /**
+   * Puts this value's texture back on its unit. Texture units are context
+   * state shared by every kernel, and each kernel numbers its own from zero,
+   * so between runs another kernel's textures sit on them (#862). The data
+   * in this texture is intact -- only the binding needs to come back.
+   */
+  rebind() {
+    if (!this.texture || this.contextHandle === undefined || this.contextHandle === null) return;
+    const { context: gl } = this;
+    gl.activeTexture(this.contextHandle);
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+  }
+
   checkSize(width, height) {
     if (!this.kernel.validate) return;
     const { maxTextureSize } = this.kernel.constructor.features;
@@ -65,11 +78,14 @@ class WebGLKernelArray extends WebGLKernelValue {
     switch (value.constructor) {
       case Uint8ClampedArray:
       case Uint8Array:
-      case Int8Array:
         return 1;
       case Uint16Array:
-      case Int16Array:
         return 2;
+        // signed arrays transfer as Float32Array (see getTransferArrayType),
+        // since the unsigned decode cannot represent negative values, so they
+        // occupy 4 bytes per element like Float32Array (#701)
+      case Int8Array:
+      case Int16Array:
       case Float32Array:
       case Int32Array:
       default:

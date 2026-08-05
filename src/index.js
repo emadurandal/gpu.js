@@ -18,6 +18,14 @@ const { WebGL2FunctionNode } = require('./backend/web-gl2/function-node');
 const { WebGL2Kernel } = require('./backend/web-gl2/kernel');
 const { kernelValueMaps: webGL2KernelValueMaps } = require('./backend/web-gl2/kernel-value-maps');
 
+const { WGSLFunctionNode } = require('./backend/web-gpu/function-node');
+const { WebGPUKernel } = require('./backend/web-gpu/kernel');
+const { WebGPUContext } = require('./backend/web-gpu/context');
+const { WebGPUBufferResult } = require('./backend/web-gpu/buffer-result');
+
+const { WebAssemblyFunctionNode } = require('./backend/web-assembly/function-node');
+const { WebAssemblyKernel } = require('./backend/web-assembly/kernel');
+
 const { GLKernel } = require('./backend/gl/kernel');
 
 const { Kernel } = require('./backend/kernel');
@@ -46,6 +54,14 @@ module.exports = {
   WebGLFunctionNode,
   WebGLKernel,
   webGLKernelValueMaps,
+
+  WGSLFunctionNode,
+  WebGPUKernel,
+  WebGPUContext,
+  WebGPUBufferResult,
+
+  WebAssemblyFunctionNode,
+  WebAssemblyKernel,
 
   GLKernel,
   Kernel,

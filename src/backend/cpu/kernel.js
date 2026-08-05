@@ -73,7 +73,13 @@ class CPUKernel extends Kernel {
 
   initContext() {
     if (!this.canvas) return null;
-    return this.canvas.getContext('2d');
+    // This context exists only to draw media and read it straight back with
+    // getImageData. Without the hint the browser keeps the canvas on the GPU,
+    // and reading it back is not bit-exact with the decoded image: a pixel that
+    // decodes to 253 comes back as 252, so the CPU backend disagreed with the
+    // WebGL ones, which upload the media as a texture and never round-trip it
+    // through a canvas.
+    return this.canvas.getContext('2d', { willReadFrequently: true });
   }
 
   initPlugins(settings) {
@@ -137,6 +143,9 @@ class CPUKernel extends Kernel {
    */
   build() {
     if (this.built) return;
+    if (this.randomSeed !== null) {
+      console.warn('randomSeed is not supported in cpu mode; Math.random() will be unseeded');
+    }
     this.setupConstants();
     this.setupArguments(arguments);
     this.validateSettings(arguments);
@@ -394,7 +403,9 @@ class CPUKernel extends Kernel {
   getPixels(flip) {
     const [width, height] = this.output;
     // cpu is not flipped by default
-    return flip ? utils.flipPixels(this._imageData.data, width, height) : this._imageData.data.slice(0);
+    const result = flip ? utils.flipPixels(this._imageData.data, width, height) : this._imageData.data.slice(0);
+    // a Promise under the async contract, matching every other backend
+    return this.asyncMode ? Promise.resolve(result) : result;
   }
 
   _imageTo3DArray(images) {

@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <link rel="icon" href="data:,">
   <title>GPU.JS : Test All</title>
   <link rel="stylesheet" href="../node_modules/qunit/qunit/qunit.css">
 
@@ -36,6 +37,100 @@
 <script src="../node_modules/sinon/pkg/sinon.js"></script>
 <script src="../node_modules/qunit/qunit/qunit.js"></script>
 <script src="../node_modules/acorn/dist/acorn.js"></script>
+<script>
+  // Machine-readable results for automated browser runs (test/browserstack/run.js).
+  // QUnit's HTML output alone is not enough: a test that fails after its own
+  // testDone leaves no failing <li> behind, so failures can go unreported.
+  (function () {
+    const results = window.__qunitResults = {
+      done: false,
+      total: 0,
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      tests: [],
+      modules: {},
+      pageErrors: []
+    };
+
+    // Crash tolerance. A test that throws from a callback QUnit is not inside --
+    // an image onload, a promise, a WebGL callback -- escapes QUnit's try/catch,
+    // so its assert.async() done() never fires and the whole run stops on that
+    // test forever. One broken test must not cost us the other 3000 results, so
+    // cap every test: QUnit fails a test that overruns and moves to the next.
+    // Remote grids are slower than a local machine, hence the override.
+    const timeoutParam = new URLSearchParams(location.search).get('testTimeout');
+    QUnit.config.testTimeout = timeoutParam ? Number(timeoutParam) : 30000;
+
+    // Those escaped errors are still the most useful diagnostic in the run, and
+    // by default they land nowhere. Record them against whatever was running,
+    // which is almost always the test that threw.
+    let running = null;
+    QUnit.on('testStart', testStart => { running = testStart.fullName.join(': '); });
+    function recordPageError(message, stack) {
+      results.pageErrors.push({
+        during: running,
+        message: String(message).slice(0, 300),
+        stack: String(stack || '').split('\n').slice(0, 6).join('\n')
+      });
+    }
+    window.addEventListener('error', event => recordPageError(event.message, event.error && event.error.stack));
+    window.addEventListener('unhandledrejection', event => recordPageError(event.reason, event.reason && event.reason.stack));
+    // A failed deepEqual carries no message, only expected and actual, so
+    // falling back to the stack reports where the assertion is rather than what
+    // went wrong — useless for the automated runners that read this.
+    function describeValue(value) {
+      if (value === null || typeof value !== 'object') return String(value);
+      const values = Array.from(value.length !== undefined ? value : Object.values(value));
+      const head = values.slice(0, 6).map(describeValue).join(', ');
+      return `[${head}${values.length > 6 ? `, …${values.length - 6} more` : ''}]`;
+    }
+    function describeError(error) {
+      if (error.message) return error.message;
+      if ('expected' in error || 'actual' in error) {
+        return `expected ${describeValue(error.expected)}, got ${describeValue(error.actual)}`;
+      }
+      return (error.stack || '').split('\n')[0] || 'failed';
+    }
+
+    QUnit.on('testEnd', testEnd => {
+      // Per-module tallies let a Node-side runner report one result per module
+      // from a single page load, instead of reloading this page — which pulls
+      // in the bundle and every test file — once per module.
+      const moduleName = testEnd.fullName.length > 1 ? testEnd.fullName[0] : '(no module)';
+      const tally = results.modules[moduleName] || (results.modules[moduleName] = {
+        passed: 0, failed: 0, skipped: 0, failures: []
+      });
+      if (testEnd.status === 'failed') tally.failed++;
+      else if (testEnd.status === 'skipped') tally.skipped++;
+      else tally.passed++;
+
+      if (testEnd.status !== 'failed') return;
+      const entry = {
+        name: testEnd.fullName.join(': '),
+        status: 'fail',
+        message: testEnd.errors.map(describeError).join(' | ').slice(0, 500)
+      };
+      tally.failures.push(entry);
+      results.tests.push(entry);
+    });
+    QUnit.on('error', error => {
+      results.tests.push({
+        name: 'global failure',
+        status: 'fail',
+        message: String((error && error.message) || error).slice(0, 500)
+      });
+    });
+    QUnit.on('runEnd', runEnd => {
+      const counts = runEnd.testCounts;
+      results.total = counts.total;
+      results.passed = counts.passed;
+      results.failed = counts.failed;
+      results.skipped = counts.skipped;
+      results.done = true;
+    });
+  })();
+</script>
 <!-- the following list of javascript files is built automatically -->
 <script type="module" src="features/add-custom-function.js"></script>
 <script type="module" src="features/add-custom-native-function.js"></script>
@@ -44,9 +139,12 @@
 <script type="module" src="features/argument-array1d-types.js"></script>
 <script type="module" src="features/argument-array2d-types.js"></script>
 <script type="module" src="features/argument-array3d-types.js"></script>
+<script type="module" src="features/argument-type-changes.js"></script>
 <script type="module" src="features/arithmetic-operators.js"></script>
 <script type="module" src="features/assignment-operators.js"></script>
+<script type="module" src="features/async-mode.js"></script>
 <script type="module" src="features/basic-math.js"></script>
+<script type="module" src="features/bitwise-not-coverage.js"></script>
 <script type="module" src="features/bitwise-operators.js"></script>
 <script type="module" src="features/boolean-from-expression.js"></script>
 <script type="module" src="features/canvas.js"></script>
@@ -78,16 +176,21 @@
 <script type="module" src="features/infinity.js"></script>
 <script type="module" src="features/inject-native.js"></script>
 <script type="module" src="features/input.js"></script>
+<script type="module" src="features/integer-division.js"></script>
 <script type="module" src="features/internally-defined-matrices.js"></script>
 <script type="module" src="features/json.js"></script>
 <script type="module" src="features/legacy-encoder.js"></script>
 <script type="module" src="features/loops.js"></script>
 <script type="module" src="features/math-object.js"></script>
+<script type="module" src="features/minified-kernels.js"></script>
+<script type="module" src="features/modulo-comparison.js"></script>
 <script type="module" src="features/nested-function.js"></script>
+<script type="module" src="features/numeric-promotion.js"></script>
 <script type="module" src="features/offscreen-canvas.js"></script>
 <script type="module" src="features/optimize-float-memory.js"></script>
 <script type="module" src="features/output.js"></script>
 <script type="module" src="features/promise-api.js"></script>
+<script type="module" src="features/random-seed.js"></script>
 <script type="module" src="features/raw-output.js"></script>
 <script type="module" src="features/read-color-texture.js"></script>
 <script type="module" src="features/read-from-texture.js"></script>
@@ -111,13 +214,17 @@
 <script type="module" src="internal/context-inheritance.js"></script>
 <script type="module" src="internal/deep-types.js"></script>
 <script type="module" src="internal/deprecated.js"></script>
+<script type="module" src="internal/destroy-releases-resources.js"></script>
 <script type="module" src="internal/different-texture-cloning.js"></script>
+<script type="module" src="internal/dynamic-output-texture-cache.js"></script>
 <script type="module" src="internal/function-builder.js"></script>
 <script type="module" src="internal/function-composition.js"></script>
 <script type="module" src="internal/function-node.js"></script>
 <script type="module" src="internal/function-return-type-detection.js"></script>
 <script type="module" src="internal/function-tracer.js"></script>
+<script type="module" src="internal/functions-as-strings.js"></script>
 <script type="module" src="internal/gpu-methods.js"></script>
+<script type="module" src="internal/hoisted-index-reads.js"></script>
 <script type="module" src="internal/implied-else.js"></script>
 <script type="module" src="internal/kernel-run-shortcut.js"></script>
 <script type="module" src="internal/kernel.js"></script>
@@ -133,6 +240,8 @@
 <script type="module" src="internal/texture-index.js"></script>
 <script type="module" src="internal/underscores.js"></script>
 <script type="module" src="internal/utils.js"></script>
+<script type="module" src="internal/webgl-precision-fallback.js"></script>
+<script type="module" src="internal/wgsl-codegen.js"></script>
 <script type="module" src="issues/114-create-kernel-map-run-second-time.js"></script>
 <script type="module" src="issues/116-multiple-kernels-run-again.js"></script>
 <script type="module" src="issues/130-typed-array.js"></script>
@@ -183,9 +292,48 @@
 <script type="module" src="issues/585-inaccurate-lookups.js"></script>
 <script type="module" src="issues/586-unable-to-resize.js"></script>
 <script type="module" src="issues/608-rewritten-arrays.js"></script>
+<script type="module" src="issues/647-atan2-range.js"></script>
+<script type="module" src="issues/701-signed-typed-array-input.js"></script>
+<script type="module" src="issues/778-webgl-kernel-experimental.js"></script>
+<script type="module" src="issues/844-browser-bundle-global.js"></script>
+<script type="module" src="issues/854-assignment-expression-parens.js"></script>
+<script type="module" src="issues/855-switch-case-break.js"></script>
+<script type="module" src="issues/857-array-and-typed-array.js"></script>
+<script type="module" src="issues/858-local-shadowing-a-constant.js"></script>
+<script type="module" src="issues/860-864-gl-emitter.js"></script>
+<script type="module" src="issues/862-constants-clobbered-across-kernels.js"></script>
+<script type="module" src="issues/863-bundled-addfunction-names.js"></script>
+<script type="module" src="issues/865-cpu-control-flow.js"></script>
+<script type="module" src="issues/867-gl-edge-shapes.js"></script>
 <script type="module" src="issues/91-create-kernel-map-array.js"></script>
 <script type="module" src="issues/96-param-names.js"></script>
+<script type="module" src="features/pipeline/buffers.js"></script>
+<script type="module" src="features/pipeline/correctness.js"></script>
+<script type="module" src="features/pipeline/fused-webasm.js"></script>
+<script type="module" src="features/pipeline/fused-webgpu.js"></script>
+<script type="module" src="features/pipeline/lifecycle.js"></script>
+<script type="module" src="features/pipeline/threaded-webasm.js"></script>
+<script type="module" src="features/pipeline/trace-rules.js"></script>
 <script type="module" src="features/to-string/as-file.js"></script>
+<script type="module" src="features/webasm/arguments-and-constants.js"></script>
+<script type="module" src="features/webasm/basics.js"></script>
+<script type="module" src="features/webasm/control-flow.js"></script>
+<script type="module" src="features/webasm/fallbacks.js"></script>
+<script type="module" src="features/webasm/module-cache.js"></script>
+<script type="module" src="features/webasm/pipeline.js"></script>
+<script type="module" src="features/webasm/random.js"></script>
+<script type="module" src="features/webasm/simd-and-threads.js"></script>
+<script type="module" src="features/webgpu/arguments.js"></script>
+<script type="module" src="features/webgpu/basics.js"></script>
+<script type="module" src="features/webgpu/constants.js"></script>
+<script type="module" src="features/webgpu/control-flow.js"></script>
+<script type="module" src="features/webgpu/dynamic-output.js"></script>
+<script type="module" src="features/webgpu/errors.js"></script>
+<script type="module" src="features/webgpu/graphical.js"></script>
+<script type="module" src="features/webgpu/math.js"></script>
+<script type="module" src="features/webgpu/pipeline.js"></script>
+<script type="module" src="features/webgpu/random.js"></script>
+<script type="module" src="features/webgpu/returns.js"></script>
 <script type="module" src="internal/backend/cpu-kernel.js"></script>
 <script type="module" src="internal/backend/gl-kernel.js"></script>
 <script type="module" src="internal/backend/function-node/isSafe.js"></script>

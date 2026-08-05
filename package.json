@@ -1,6 +1,6 @@
 {
   "name": "gpu.js",
-  "version": "2.16.0",
+  "version": "2.24.0",
   "description": "GPU Accelerated JavaScript",
   "engines": {
     "node": ">=8.0.0"
@@ -19,39 +19,41 @@
   },
   "dependencies": {
     "acorn": "8.14.0",
-    "gl": "8.1.6",
-    "gl-wiretap": "0.6.2",
-    "gpu-mock.js": "github:weagle08/gpu-mock.js",
-    "ordered-read-streams": "^2.0.0",
+    "gpu-mock.js": "^1.4.1",
     "webgpu": "0.2.9"
   },
+  "optionalDependencies": {
+    "gl": "8.1.6"
+  },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "benchmark": "2.1.4",
-    "browser-sync": "3.0.2",
-    "browserify": "17.0.0",
+    "browserstack-local": "^1.5.6",
     "c8": "10.1.2",
-    "gulp": "5.0.0",
-    "gulp-concat": "2.6.1",
-    "gulp-header": "2.0.9",
-    "gulp-jsbeautifier": "3.0.1",
-    "gulp-rename": "2.0.0",
-    "gulp-replace": "1.1.4",
-    "gulp-strip-comments": "2.6.0",
-    "gulp-uglify-es": "3.0.0",
-    "merge-stream": "2.0.0",
+    "decomment": "^0.9.5",
+    "js-beautify": "^1.15.4",
     "qunit": "2.22.0",
     "read-dir-deep": "8.0.0",
+    "rolldown": "^1.2.0",
+    "selenium-webdriver": "^4.27.0",
     "sinon": "18.0.0",
-    "vinyl-buffer": "1.0.1",
-    "vinyl-source-stream": "2.0.0"
+    "terser": "^5.49.0"
   },
   "scripts": {
     "test": "qunit test/issues test/internal test/features",
+    "test:browserstack": "node test/browserstack/run.js --browsers=real-devices",
+    "test:browserstack:desktop": "node test/browserstack/run.js --browsers=desktop",
+    "test:browserstack:qunit": "node test/browserstack/run.js --browsers=desktop --suite=qunit",
     "coverage": "c8 qunit test/issues test/internal test/features",
-    "setup": "npm i -g gulp-cli",
-    "make": "gulp make",
-    "build": "gulp build",
-    "docs": "doxdox ./src --layout bootstrap --output docs.html"
+    "make": "node scripts/make.js",
+    "build": "node scripts/build.js",
+    "docs": "npx --yes doxdox@3 ./src --layout bootstrap --output index.html",
+    "minify": "node scripts/minify.js",
+    "beautify": "node scripts/beautify.js",
+    "build-tests": "node scripts/build-tests.js",
+    "dev": "node scripts/dev.js",
+    "test:browser": "playwright test --project=chromium",
+    "test:browser:all": "playwright test"
   },
   "repository": {
     "type": "git",
@@ -66,6 +68,13 @@
   "bugs": {
     "url": "https://github.com/gpujs/gpu.js/issues"
   },
-  "homepage": "http://gpu.rocks/",
-  "typings": "./src/index.d.ts"
+  "homepage": "https://gpu.rocks/",
+  "typings": "./src/index.d.ts",
+  "overrides": {
+    "gl": {
+      "node-gyp": "^11.4.2"
+    },
+    "immutable": "^4.3.9",
+    "minimatch@^9.0.1": "^10.2.5"
+  }
 }

@@ -14,8 +14,12 @@ __CONSTANTS__;
 in vec2 vTexCoord;
 
 float atan2(float v1, float v2) {
-  if (v1 == 0.0 || v2 == 0.0) return 0.0;
-  return atan(v1 / v2);
+  if (v2 == 0.0) {
+    if (v1 == 0.0) return 0.0;
+    if (v1 > 0.0) return 1.5707963267948966;
+    if (v1 < 0.0) return -1.5707963267948966;
+  }
+  return atan(v1, v2);
 }
 
 float cbrt(float x) {
@@ -112,17 +116,12 @@ int bitwiseAnd(int a, int b) {
   return result;
 }
 int bitwiseNot(int a) {
-  int result = 0;
-  int n = 1;
-  
-  for (int i = 0; i < BIT_COUNT; i++) {
-    if (modi(a, 2) == 0) {
-      result += n;    
-    }
-    a = a / 2;
-    n = n * 2;
-  }
-  return result;
+  // ~a is identically -a - 1 in two's complement, for every value including
+  // negatives. The previous bit-by-bit loop only worked for a >= 0, where it
+  // leaned on 32-bit overflow wrapping to reach the negative answer; given a
+  // negative input it computed ~abs(a), so ~(-1) gave -2 and ~~x never
+  // returned x.
+  return -a - 1;
 }
 int bitwiseZeroFillLeftShift(int n, int shift) {
   int maxBytes = BIT_COUNT;
@@ -150,8 +149,14 @@ int bitwiseZeroFillLeftShift(int n, int shift) {
   return result;
 }
 
+// _pow2 is defined further down, alongside encode32/decode32
+float _pow2(float e);
 int bitwiseSignedRightShift(int num, int shifts) {
-  return int(floor(float(num) / pow(2.0, float(shifts))));
+  // pow(2.0, n) is approximate on many GPUs, and landing 1 ulp high makes the
+  // division fall just under a whole number, which floor() then rounds away:
+  // 2 >> 1 came out 0, 8 >> 1 came out 3. Only exact left operands were
+  // affected, odd ones having enough slack to survive. _pow2 is exact.
+  return int(floor(float(num) / _pow2(float(shifts))));
 }
 
 int bitwiseZeroFillRightShift(int n, int shift) {
@@ -203,12 +208,64 @@ int integerMod(int x, int y) {
   return x - (y * int(x/y));
 }
 
+// GLSL ES 1.00 accepts only a constant or a loop symbol inside an index
+// expression, so m[y][x] does not compile when y and x come from kernel
+// arguments -- the error is "Index expression can only contain const or loop
+// symbols". Loop counters are legal indices, so walk the matrix with them
+// instead. These are 2x2 to 4x4, so it costs at most sixteen comparisons.
+float getMatrix2(mat2 m, int y, int x) {
+  float result = 0.0;
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+      if (i == y && j == x) result = m[i][j];
+    }
+  }
+  return result;
+}
+
+float getMatrix3(mat3 m, int y, int x) {
+  float result = 0.0;
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      if (i == y && j == x) result = m[i][j];
+    }
+  }
+  return result;
+}
+
+float getMatrix4(mat4 m, int y, int x) {
+  float result = 0.0;
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 4; j++) {
+      if (i == y && j == x) result = m[i][j];
+    }
+  }
+  return result;
+}
+
 __DIVIDE_WITH_INTEGER_CHECK__;
 
 // Here be dragons!
 // DO NOT OPTIMIZE THIS CODE
 // YOU WILL BREAK SOMETHING ON SOMEBODY\'S MACHINE
 // LEAVE IT AS IT IS, LEST YOU WASTE YOUR OWN TIME
+// Exact powers of two built from exact constant multiplies: exp2/log2/pow
+// are approximate on some GPUs (notably Apple silicon), and 1-2 ulp there
+// corrupts the packed bytes (#659)
+float _pow2(float e) {
+  float r = 1.0;
+  float a = abs(e);
+  bool n = e < 0.0;
+  if (a >= 64.0) { r *= n ? 5.421010862427522e-20 : 18446744073709551616.0; a -= 64.0; }
+  if (a >= 64.0) { r *= n ? 5.421010862427522e-20 : 18446744073709551616.0; a -= 64.0; }
+  if (a >= 32.0) { r *= n ? 2.3283064365386963e-10 : 4294967296.0; a -= 32.0; }
+  if (a >= 16.0) { r *= n ? 0.0000152587890625 : 65536.0; a -= 16.0; }
+  if (a >= 8.0) { r *= n ? 0.00390625 : 256.0; a -= 8.0; }
+  if (a >= 4.0) { r *= n ? 0.0625 : 16.0; a -= 4.0; }
+  if (a >= 2.0) { r *= n ? 0.25 : 4.0; a -= 2.0; }
+  if (a >= 1.0) { r *= n ? 0.5 : 2.0; }
+  return r;
+}
 const vec2 MAGIC_VEC = vec2(1.0, -256.0);
 const vec4 SCALE_FACTOR = vec4(1.0, 256.0, 65536.0, 0.0);
 const vec4 SCALE_FACTOR_INV = vec4(1.0, 0.00390625, 0.0000152587890625, 0.0); // 1, 1/256, 1/65536
@@ -219,9 +276,9 @@ float decode32(vec4 texel) {
   gte128.x = texel.b >= 128.0 ? 1.0 : 0.0;
   gte128.y = texel.a >= 128.0 ? 1.0 : 0.0;
   float exponent = 2.0 * texel.a - 127.0 + dot(gte128, MAGIC_VEC);
-  float res = exp2(round(exponent));
+  float res = _pow2(round(exponent));
   texel.b = texel.b - 128.0 * gte128.x;
-  res = dot(texel, SCALE_FACTOR) * exp2(round(exponent-23.0)) + res;
+  res = dot(texel, SCALE_FACTOR) * _pow2(round(exponent-23.0)) + res;
   res *= gte128.y * -2.0 + 1.0;
   return res;
 }
@@ -266,8 +323,12 @@ vec4 encode32(float value) {
   value = abs(value);
 
   exponent = floor(log2(value));
+  float p2 = _pow2(exponent);
+  // approximate log2 can land one off; correct by direct comparison
+  if (p2 > value) { exponent -= 1.0; p2 *= 0.5; }
+  else if (p2 * 2.0 <= value) { exponent += 1.0; p2 *= 2.0; }
 
-  mantissa = value*pow(2.0, -exponent)-1.0;
+  mantissa = value / p2 - 1.0;
   exponent = exponent+127.0;
   result   = vec4(0,0,0,0);
 

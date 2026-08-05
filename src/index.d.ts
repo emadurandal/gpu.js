@@ -8,6 +8,10 @@ export class GPU {
   static isOffscreenCanvasSupported: boolean;
   static isGPUHTMLImageArraySupported: boolean;
   static isSinglePrecisionSupported: boolean;
+  /** WebGPU API surface exists (navigator.gpu); an adapter may still be absent — await isWebGPUAvailable() for the authoritative answer */
+  static isWebGPUSupported: boolean;
+  static isWebGPUAvailable(): Promise<boolean>;
+  static isWebAssemblySupported: boolean;
   constructor(settings?: IGPUSettings);
   functions: GPUFunction<ThreadKernelVariable[]>[];
   nativeFunctions: IGPUNativeFunction[];
@@ -25,6 +29,13 @@ export class GPU {
       | void
       )
     & IKernelRunShortcutBase;
+  /**
+   * A kernel may also be given as source text. This is the only form available
+   * where the engine does not retain function source — React Native's Hermes,
+   * for instance, returns "function name(a0, a1) { [bytecode] }" from
+   * Function.prototype.toString().
+   */
+  createKernel(kernel: string, settings?: IGPUKernelSettings): IKernelRunShortcut;
   createKernel<ArgTypes extends ThreadKernelVariable[], ConstantsT extends IConstantsThis>(kernel: KernelFunction<ArgTypes, ConstantsT>, settings?: IGPUKernelSettings): IKernelRunShortcut;
   createKernel<KernelType extends KernelFunction>(kernel: KernelType, settings?: IGPUKernelSettings):
     ((...args: Parameters<KernelType>) =>
@@ -42,6 +53,14 @@ export class GPU {
     subKernels: ISubKernelObject,
     rootKernel: ThreadFunction<ArgTypes, ConstantsType>,
     settings?: IGPUKernelSettings): (((this: IKernelFunctionThis<ConstantsType>, ...args: ArgTypes) => IMappedKernelResult) & IKernelMapRunShortcut<typeof subKernels>);
+  /**
+   * Compile a whole multi-kernel computation into one callable plan. The
+   * orchestration function runs once, at build time (first call), with
+   * opaque handles for arguments; the kernel calls it makes are recorded
+   * and replayed on later calls with intermediates kept resident. Calling
+   * the pipeline always returns a Promise.
+   */
+  createPipeline(fn: PipelineFunction, settings?: IPipelineSettings): IPipelineRunShortcut;
   destroy(): Promise<void>;
   Kernel: typeof Kernel;
   mode: string;
@@ -93,8 +112,8 @@ export interface INativeFunctionList {
   [name: string]: INativeFunction
 }
 
-export type GPUMode = 'gpu' | 'cpu' | 'dev';
-export type GPUInternalMode = 'webgl' | 'webgl2' | 'headlessgl';
+export type GPUMode = 'gpu' | 'cpu' | 'dev' | 'async';
+export type GPUInternalMode = 'webgl' | 'webgl2' | 'headlessgl' | 'webgpu' | 'webasm';
 
 export interface IGPUSettings {
   mode?: GPUMode | GPUInternalMode;
@@ -175,12 +194,14 @@ export class Kernel {
   texture: Texture;
   mappedTextures?: Texture[];
   TextureConstructor: typeof Texture;
-  getPixels(flip?: boolean): Uint8ClampedArray[];
+  getPixels(flip?: boolean): Uint8ClampedArray;
   getVariablePrecisionString(textureSize?: number[], tactic?: Tactic, isInt?: boolean): string;
   prependString(value: string): void;
   hasPrependString(value: string): boolean;
   constructor(kernel: KernelFunction|IKernelJSON|string, settings?: IDirectKernelSettings);
   onRequestSwitchKernel?: Kernel;
+  /** why this kernel's work was degraded to the cpu backend, when it was (#868) */
+  fallbackReason: string | null;
   onActivate(previousKernel: Kernel): void;
   build(...args: KernelVariable[]): void;
   run(...args: KernelVariable[]): KernelVariable;
@@ -198,9 +219,11 @@ export class Kernel {
   setConstantTypes(flag: IKernelValueTypes): this;
   setDynamicOutput(flag: boolean): this;
   setDynamicArguments(flag: boolean): this;
+  setRandomSeed(seed: number): this;
   setPipeline(flag: boolean): this;
   setPrecision(flag: Precision): this;
   setImmutable(flag: boolean): this;
+  setAsyncMode(flag: boolean): this;
   setCanvas(flag: any): this;
   setContext(flag: any): this;
   addFunction<ArgTypes extends ThreadKernelVariable[]>(flag: GPUFunction<ArgTypes>, settings?: IFunctionSettings): this;
@@ -246,6 +269,12 @@ export type Precision = 'single' | 'unsigned';
 
 export class CPUKernel extends Kernel {
 
+}
+export class WebAssemblyKernel extends Kernel {
+  /** LRU bound on cached per-size-signature wasm instantiations (#870) */
+  moduleCacheLimit: number;
+  /** worker-pool size cap for threaded runs; null lets the pool decide */
+  poolSize: number | null;
 }
 export class GLKernel extends Kernel {
 
@@ -329,6 +358,10 @@ export interface IKernelSettings {
   pipeline?: boolean;
   immutable?: boolean;
   graphical?: boolean;
+  /** every call returns a Promise of the result; non-blocking readback where the backend supports it (webgl2, webgpu) */
+  asyncMode?: boolean;
+  /** webasm only: caps the worker pool for threaded runs; defaults to hardwareConcurrency (or 4 when unreadable) */
+  poolSize?: number;
   onRequestFallback?: () => Kernel;
   optimizeFloatMemory?: boolean;
   dynamicOutput?: boolean;
@@ -337,6 +370,7 @@ export interface IKernelSettings {
   useLegacyEncoder?: boolean;
   nativeFunctions?: IGPUNativeFunction[],
   strictIntegers?: boolean;
+  randomSeed?: number;
 }
 
 export interface IDirectKernelSettings extends IKernelSettings {
@@ -360,6 +394,62 @@ export interface IKernelRunShortcut extends IKernelRunShortcutBase {
 
 export interface IKernelMapRunShortcut<SubKernelType> extends IKernelRunShortcutBase<
   { result: KernelOutput } & { [key in keyof SubKernelType]: KernelOutput }> {}
+
+/**
+ * Opaque stand-in for an intermediate result during pipeline orchestration.
+ * Reading elements or properties, or using it in arithmetic or conditions,
+ * throws at build time; its only legal uses are as a kernel argument and in
+ * the orchestration function's return value.  Typed `any` because the same
+ * kernel shortcut that normally returns values returns handles while a trace
+ * is open — a distinction the type system cannot express; the trace enforces
+ * it at build time with named errors.
+ */
+export type IPipelineHandle = any;
+
+export type PipelineFunction = (this: { constants: IConstantsThis }, ...args: IPipelineHandle[]) =>
+  IPipelineHandle | IPipelineHandle[] | { [key: string]: IPipelineHandle };
+
+export interface IPipelineSettings {
+  /** false pins the webasm lowering to its sync path (no worker pool) */
+  threads?: boolean;
+  /** trace-time facts; change via setConstants, which re-traces on the next call */
+  constants?: IConstants;
+}
+
+export type PipelineResult = KernelOutput | KernelOutput[] | { [key: string]: KernelOutput };
+
+/** the underlying Pipeline instance behind an IPipelineRunShortcut */
+export interface IPipeline {
+  constants: IConstants;
+  destroyed: boolean;
+  executorKind: string;
+  fallbackReason: string | null;
+  plan: object | null;
+  call(args: KernelVariable[] | IArguments): Promise<PipelineResult>;
+  setConstants(constants: IConstants): this;
+  destroy(): Promise<void>;
+}
+
+export interface IPipelineRunShortcut {
+  /** the backend mode that actually executes the plan (the clones'), null before the first call */
+  readonly backend: string | null;
+  (...args: KernelVariable[]): Promise<PipelineResult>;
+  pipeline: IPipeline;
+  setConstants(constants: IConstants): this;
+  destroy(): Promise<void>;
+  /**
+   * 'generic' runs step-by-step through the normal kernel machinery on every
+   * backend; 'fused-sync' runs every step over one shared wasm memory on the
+   * webasm backend; 'fused-threaded' has pool workers walk the whole plan
+   * over that memory on an Atomics barrier; 'fused-encoder' records every
+   * step into one WebGPU command encoder over persistent storage buffers
+   */
+  readonly executorKind: string;
+  /** why the fused executor declined this plan; null while fused */
+  readonly fallbackReason: string | null;
+  /** the compiled plan IR; null until the first call builds it */
+  readonly plan: object | null;
+}
 
 export interface IKernelFeatures {
   isFloatRead: boolean;
@@ -558,6 +648,7 @@ export interface IFunctionNodeSettings extends IFunctionSettings {
 export class WebGLFunctionNode extends FunctionNode {}
 export class WebGL2FunctionNode extends WebGLFunctionNode {}
 export class CPUFunctionNode extends FunctionNode {}
+export class WebAssemblyFunctionNode extends FunctionNode {}
 
 export interface IGPUTextureSettings {
   texture: WebGLTexture;

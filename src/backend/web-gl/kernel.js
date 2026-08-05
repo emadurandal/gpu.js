@@ -62,7 +62,8 @@ class WebGLKernel extends GLKernel {
       testCanvas = new OffscreenCanvas(0, 0);
     }
     if (!testCanvas) return;
-    testContext = testCanvas.getContext('webgl') || testCanvas.getContext('experimental-webgl');
+    testContext = testCanvas.getContext('webgl');
+    if (!testContext && !(testCanvas instanceof OffscreenCanvas)) testContext = testCanvas.getContext('experimental-webgl');
     if (!testContext || !testContext.getExtension) return;
     testExtensions = {
       OES_texture_float: testContext.getExtension('OES_texture_float'),
@@ -264,8 +265,11 @@ class WebGLKernel extends GLKernel {
       throw new Error('Float textures are not supported');
     } else if (this.precision === 'single' && !features.isFloatRead) {
       throw new Error('Single precision not supported');
-    } else if (!this.graphical && this.precision === null && features.isTextureFloat) {
-      this.precision = features.isFloatRead ? 'single' : 'unsigned';
+    } else if (!this.graphical && this.precision === null) {
+      // a context without OES_texture_float cannot do single precision, but it
+      // can still do unsigned; leaving precision null here made every kernel on
+      // such a device throw "precision missing" from lookupKernelValueType
+      this.precision = features.isTextureFloat && features.isFloatRead ? 'single' : 'unsigned';
     }
 
     if (this.subKernels && this.subKernels.length > 0 && !this.extensions.WEBGL_draw_buffers) {
@@ -395,7 +399,8 @@ class WebGLKernel extends GLKernel {
       }
       const KernelValue = this.constructor.lookupKernelValueType(type, this.dynamicArguments ? 'dynamic' : 'static', this.precision, args[index]);
       if (KernelValue === null) {
-        return this.requestFallback(args);
+        return this.requestFallback(args,
+          `argument "${ this.argumentNames[index] }" of type ${ type } is not supported by ${ this.constructor.name }`);
       }
       const kernelArgument = new KernelValue(value, {
         name,
@@ -424,6 +429,23 @@ class WebGLKernel extends GLKernel {
     return texture;
   }
 
+  /**
+   * @desc Delete a texture, and remove it from the cache that would otherwise
+   * retain it until the kernel is destroyed
+   * @param {WebGLTexture} texture
+   */
+  deleteTexture(texture) {
+    const index = this.textureCache.indexOf(texture);
+    if (index !== -1) {
+      this.textureCache.splice(index, 1);
+    }
+    // a Texture keeps a reference to the kernel that made it, so it can outlive
+    // that kernel and call back here after destroy() has released the context.
+    // The GL texture went with the context, so there is nothing left to free.
+    if (!this.context) return;
+    this.context.deleteTexture(texture);
+  }
+
   setupConstants(args) {
     const { context: gl } = this;
     this.kernelConstants = [];
@@ -445,7 +467,8 @@ class WebGLKernel extends GLKernel {
       }
       const KernelValue = this.constructor.lookupKernelValueType(type, 'static', this.precision, value);
       if (KernelValue === null) {
-        return this.requestFallback(args);
+        return this.requestFallback(args,
+          `constant "${ name }" of type ${ type } is not supported by ${ this.constructor.name }`);
       }
       const kernelValue = new KernelValue(value, {
         name,
@@ -563,12 +586,20 @@ class WebGLKernel extends GLKernel {
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertices);
     gl.bufferSubData(gl.ARRAY_BUFFER, texCoordOffset, texCoords);
 
+    // getAttribLocation returns -1 for an attribute the GLSL compiler removed —
+    // aTexCoord goes when the fragment shader samples no texture — and passing
+    // that on raises INVALID_VALUE on every draw. Software GL keeps the unused
+    // attribute, so this only shows on real drivers.
     const aPosLoc = gl.getAttribLocation(this.program, 'aPos');
-    gl.enableVertexAttribArray(aPosLoc);
-    gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+    if (aPosLoc !== -1) {
+      gl.enableVertexAttribArray(aPosLoc);
+      gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
     const aTexCoordLoc = gl.getAttribLocation(this.program, 'aTexCoord');
-    gl.enableVertexAttribArray(aTexCoordLoc);
-    gl.vertexAttribPointer(aTexCoordLoc, 2, gl.FLOAT, false, 0, texCoordOffset);
+    if (aTexCoordLoc !== -1) {
+      gl.enableVertexAttribArray(aTexCoordLoc);
+      gl.vertexAttribPointer(aTexCoordLoc, 2, gl.FLOAT, false, 0, texCoordOffset);
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
 
     let i = 0;
@@ -613,7 +644,7 @@ class WebGLKernel extends GLKernel {
   }
 
   run() {
-    const { kernelArguments, texSize, forceUploadKernelConstants, context: gl } = this;
+    const { kernelArguments, kernelConstants, texSize, forceUploadKernelConstants, context: gl } = this;
 
     gl.useProgram(this.program);
     gl.scissor(0, 0, texSize[0], texSize[1]);
@@ -624,6 +655,13 @@ class WebGLKernel extends GLKernel {
 
     this.setUniform2f('ratio', texSize[0] / this.maxTexSize[0], texSize[1] / this.maxTexSize[1]);
 
+    // texture units belong to the shared context while every kernel counts
+    // its own from zero, so another kernel's run leaves its textures on this
+    // kernel's units (#862). Arguments re-upload below; constants were
+    // uploaded at setup and only need their binding put back.
+    for (let i = 0; i < kernelConstants.length; i++) {
+      kernelConstants[i].rebind();
+    }
     for (let i = 0; i < forceUploadKernelConstants.length; i++) {
       const constant = forceUploadKernelConstants[i];
       constant.updateValue(this.constants[constant.name]);
@@ -660,9 +698,12 @@ class WebGLKernel extends GLKernel {
     }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
-    if (this.immutable) {
-      this._replaceOutputTexture();
-    }
+    // not only for immutable kernels: clone() shares the underlying GL
+    // texture and counts a ref, so a mutable kernel re-rendering must honor
+    // outstanding clones by detaching first (beforeMutate is a no-op when
+    // nothing was cloned) -- otherwise every clone silently reads the next
+    // run's values
+    this._replaceOutputTexture();
 
     if (this.subKernels !== null) {
       if (this.immutable) {
@@ -1086,8 +1127,11 @@ class WebGLKernel extends GLKernel {
   _getDivideWithIntegerCheckString() {
     return this.fixIntegerDivisionAccuracy ?
       `float divWithIntCheck(float x, float y) {
-  if (floor(x) == x && floor(y) == y && integerMod(x, y) == 0.0) {
-    return float(int(x) / int(y));
+  if (floor(x) == x && floor(y) == y) {
+    float q = floor(x / y + 0.5);
+    if (y * q == x) {
+      return q;
+    }
   }
   return x / y;
 }
